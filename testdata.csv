@@ -1,0 +1,251 @@
+﻿YR_MTH_OF_YR_ID2,MTH_ID,QTR_ID,weekday_count,holiday_count,business_day_count,UNRATE,MORTGAGE30US,budget_guidance,BU,Client,Client ID,volume_type,volume_value_calc
+2022-01-01,1,1,21,1,20,4,3.4,0,Platforms,Appraisal Scope,Appraisal Scope,phone,384
+2022-01-01,1,1,21,1,20,4,3.4,0,Platforms,Closing Corp,CLP,phone,262
+2022-01-01,1,1,21,1,20,4,3.4,0,Platforms,FNC - CMS,FNC - CMS,phone,427
+2022-01-01,1,1,21,1,20,4,3.4,0,Platforms,FNC - Ports,FNC - Ports,phone,2400
+2022-01-01,1,1,21,1,20,4,3.4,0,Platforms,Mercury,Mercury,phone,2800
+2022-02-01,2,1,20,1,19,3.8,3.8,0,Platforms,Appraisal Scope,Appraisal Scope,phone,298
+2022-02-01,2,1,20,1,19,3.8,3.8,0,Platforms,Closing Corp,CLP,phone,273
+2022-02-01,2,1,20,1,19,3.8,3.8,0,Platforms,FNC - CMS,FNC - CMS,phone,394
+2022-02-01,2,1,20,1,19,3.8,3.8,0,Platforms,FNC - Ports,FNC - Ports,phone,2102
+2022-02-01,2,1,20,1,19,3.8,3.8,0,Platforms,Mercury,Mercury,phone,2281
+2022-03-01,3,1,23,0,23,3.7,4.2,0,Platforms,Appraisal Scope,Appraisal Scope,phone,448
+2022-03-01,3,1,23,0,23,3.7,4.2,0,Platforms,Closing Corp,CLP,phone,273
+2022-03-01,3,1,23,0,23,3.7,4.2,0,Platforms,FNC - CMS,FNC - CMS,phone,462
+2022-03-01,3,1,23,0,23,3.7,4.2,0,Platforms,FNC - Ports,FNC - Ports,phone,2628
+2022-03-01,3,1,23,0,23,3.7,4.2,0,Platforms,Mercury,Mercury,phone,3075
+2022-04-01,4,2,21,0,21,3.7,5,0,Platforms,Appraisal Scope,Appraisal Scope,phone,404
+2022-04-01,4,2,21,0,21,3.7,5,0,Platforms,Closing Corp,CLP,phone,285
+2022-04-01,4,2,21,0,21,3.7,5,0,Platforms,FNC - CMS,FNC - CMS,phone,424
+2022-04-01,4,2,21,0,21,3.7,5,0,Platforms,FNC - Ports,FNC - Ports,phone,2469
+2022-04-01,4,2,21,0,21,3.7,5,0,Platforms,Mercury,Mercury,phone,3044
+2022-05-01,5,2,22,1,21,3.6,5.2,0,Platforms,Appraisal Scope,Appraisal Scope,phone,337
+2022-05-01,5,2,22,1,21,3.6,5.2,0,Platforms,Closing Corp,CLP,phone,291
+2022-05-01,5,2,22,1,21,3.6,5.2,0,Platforms,FNC - CMS,FNC - CMS,phone,424
+2022-05-01,5,2,22,1,21,3.6,5.2,0,Platforms,FNC - Ports,FNC - Ports,phone,2453
+2022-05-01,5,2,22,1,21,3.6,5.2,0,Platforms,Mercury,Mercury,phone,2547
+2022-06-01,6,2,22,0,22,3.6,5.5,0,Platforms,Appraisal Scope,Appraisal Scope,phone,308
+2022-06-01,6,2,22,0,22,3.6,5.5,0,Platforms,Closing Corp,CLP,phone,281
+2022-06-01,6,2,22,0,22,3.6,5.5,0,Platforms,FNC - CMS,FNC - CMS,phone,392
+2022-06-01,6,2,22,0,22,3.6,5.5,0,Platforms,FNC - Ports,FNC - Ports,phone,2386
+2022-06-01,6,2,22,0,22,3.6,5.5,0,Platforms,Mercury,Mercury,phone,2244
+2022-07-01,7,3,21,2,19,3.5,5.4,0,Platforms,Appraisal Scope,Appraisal Scope,phone,299
+2022-07-01,7,3,21,2,19,3.5,5.4,0,Platforms,Closing Corp,CLP,phone,270
+2022-07-01,7,3,21,2,19,3.5,5.4,0,Platforms,FNC - CMS,FNC - CMS,phone,314
+2022-07-01,7,3,21,2,19,3.5,5.4,0,Platforms,FNC - Ports,FNC - Ports,phone,2232
+2022-07-01,7,3,21,2,19,3.5,5.4,0,Platforms,Mercury,Mercury,phone,1795
+2022-08-01,8,3,23,0,23,3.6,5.2,0,Platforms,Appraisal Scope,Appraisal Scope,phone,307
+2022-08-01,8,3,23,0,23,3.6,5.2,0,Platforms,Closing Corp,CLP,phone,264
+2022-08-01,8,3,23,0,23,3.6,5.2,0,Platforms,FNC - CMS,FNC - CMS,phone,265
+2022-08-01,8,3,23,0,23,3.6,5.2,0,Platforms,FNC - Ports,FNC - Ports,phone,2055
+2022-08-01,8,3,23,0,23,3.6,5.2,0,Platforms,Mercury,Mercury,phone,2111
+2022-09-01,9,3,22,1,21,3.5,6.1,0,Platforms,Appraisal Scope,Appraisal Scope,phone,259
+2022-09-01,9,3,22,1,21,3.5,6.1,0,Platforms,Closing Corp,CLP,phone,267
+2022-09-01,9,3,22,1,21,3.5,6.1,0,Platforms,FNC - CMS,FNC - CMS,phone,250
+2022-09-01,9,3,22,1,21,3.5,6.1,0,Platforms,FNC - Ports,FNC - Ports,phone,1823
+2022-09-01,9,3,22,1,21,3.5,6.1,0,Platforms,Mercury,Mercury,phone,1940
+2022-10-01,10,4,21,0,21,3.6,6.9,0,Platforms,Appraisal Scope,Appraisal Scope,phone,279
+2022-10-01,10,4,21,0,21,3.6,6.9,0,Platforms,Closing Corp,CLP,phone,308
+2022-10-01,10,4,21,0,21,3.6,6.9,0,Platforms,FNC - CMS,FNC - CMS,phone,253
+2022-10-01,10,4,21,0,21,3.6,6.9,0,Platforms,FNC - Ports,FNC - Ports,phone,1917
+2022-10-01,10,4,21,0,21,3.6,6.9,0,Platforms,Mercury,Mercury,phone,1894
+2022-11-01,11,4,22,2,20,3.6,6.8,0,Platforms,Appraisal Scope,Appraisal Scope,phone,287
+2022-11-01,11,4,22,2,20,3.6,6.8,0,Platforms,Closing Corp,CLP,phone,272
+2022-11-01,11,4,22,2,20,3.6,6.8,0,Platforms,FNC - CMS,FNC - CMS,phone,204
+2022-11-01,11,4,22,2,20,3.6,6.8,0,Platforms,FNC - Ports,FNC - Ports,phone,1599
+2022-11-01,11,4,22,2,20,3.6,6.8,0,Platforms,Mercury,Mercury,phone,2088
+2022-12-01,12,4,22,3,19,3.5,6.4,0,Platforms,Appraisal Scope,Appraisal Scope,phone,197
+2022-12-01,12,4,22,3,19,3.5,6.4,0,Platforms,Closing Corp,CLP,phone,255
+2022-12-01,12,4,22,3,19,3.5,6.4,0,Platforms,FNC - CMS,FNC - CMS,phone,204
+2022-12-01,12,4,22,3,19,3.5,6.4,0,Platforms,FNC - Ports,FNC - Ports,phone,1458
+2022-12-01,12,4,22,3,19,3.5,6.4,0,Platforms,Mercury,Mercury,phone,1463
+2023-01-01,1,1,22,2,20,3.5,6.3,0,Platforms,Appraisal Scope,Appraisal Scope,phone,224
+2023-01-01,1,1,22,2,20,3.5,6.3,0,Platforms,Closing Corp,CLP,phone,370
+2023-01-01,1,1,22,2,20,3.5,6.3,0,Platforms,FNC - CMS,FNC - CMS,phone,279
+2023-01-01,1,1,22,2,20,3.5,6.3,0,Platforms,FNC - Ports,FNC - Ports,phone,1753
+2023-01-01,1,1,22,2,20,3.5,6.3,0,Platforms,Mercury,Mercury,phone,4996
+2023-02-01,2,1,20,1,19,3.6,6.3,0,Platforms,Appraisal Scope,Appraisal Scope,phone,227
+2023-02-01,2,1,20,1,19,3.6,6.3,0,Platforms,Closing Corp,CLP,phone,284
+2023-02-01,2,1,20,1,19,3.6,6.3,0,Platforms,FNC - CMS,FNC - CMS,phone,198
+2023-02-01,2,1,20,1,19,3.6,6.3,0,Platforms,FNC - Ports,FNC - Ports,phone,1649
+2023-02-01,2,1,20,1,19,3.6,6.3,0,Platforms,Mercury,Mercury,phone,4666
+2023-03-01,3,1,23,0,23,3.5,6.5,0,Platforms,Appraisal Scope,Appraisal Scope,phone,266
+2023-03-01,3,1,23,0,23,3.5,6.5,0,Platforms,Closing Corp,CLP,phone,237
+2023-03-01,3,1,23,0,23,3.5,6.5,0,Platforms,FNC - CMS,FNC - CMS,phone,294
+2023-03-01,3,1,23,0,23,3.5,6.5,0,Platforms,FNC - Ports,FNC - Ports,phone,2045
+2023-03-01,3,1,23,0,23,3.5,6.5,0,Platforms,Mercury,Mercury,phone,6673
+2023-04-01,4,2,20,0,20,3.4,6.3,0,Platforms,Appraisal Scope,Appraisal Scope,phone,211
+2023-04-01,4,2,20,0,20,3.4,6.3,0,Platforms,Closing Corp,CLP,phone,183
+2023-04-01,4,2,20,0,20,3.4,6.3,0,Platforms,FNC - CMS,FNC - CMS,phone,166
+2023-04-01,4,2,20,0,20,3.4,6.3,0,Platforms,FNC - Ports,FNC - Ports,phone,1548
+2023-04-01,4,2,20,0,20,3.4,6.3,0,Platforms,Mercury,Mercury,phone,5526
+2023-05-01,5,2,23,1,22,3.6,6.4,0,Platforms,Appraisal Scope,Appraisal Scope,phone,280
+2023-05-01,5,2,23,1,22,3.6,6.4,0,Platforms,Closing Corp,CLP,phone,304
+2023-05-01,5,2,23,1,22,3.6,6.4,0,Platforms,FNC - CMS,FNC - CMS,phone,192
+2023-05-01,5,2,23,1,22,3.6,6.4,0,Platforms,FNC - Ports,FNC - Ports,phone,1704
+2023-05-01,5,2,23,1,22,3.6,6.4,0,Platforms,Mercury,Mercury,phone,6441
+2023-06-01,6,2,22,0,22,3.6,6.7,0,Platforms,Appraisal Scope,Appraisal Scope,phone,264
+2023-06-01,6,2,22,0,22,3.6,6.7,0,Platforms,Closing Corp,CLP,phone,357
+2023-06-01,6,2,22,0,22,3.6,6.7,0,Platforms,FNC - CMS,FNC - CMS,phone,214
+2023-06-01,6,2,22,0,22,3.6,6.7,0,Platforms,FNC - Ports,FNC - Ports,phone,1652
+2023-06-01,6,2,22,0,22,3.6,6.7,0,Platforms,Mercury,Mercury,phone,5717
+2023-07-01,7,3,21,2,19,3.5,6.8,0,Platforms,Appraisal Scope,Appraisal Scope,phone,208
+2023-07-01,7,3,21,2,19,3.5,6.8,0,Platforms,Closing Corp,CLP,phone,301
+2023-07-01,7,3,21,2,19,3.5,6.8,0,Platforms,FNC - CMS,FNC - CMS,phone,173
+2023-07-01,7,3,21,2,19,3.5,6.8,0,Platforms,FNC - Ports,FNC - Ports,phone,1516
+2023-07-01,7,3,21,2,19,3.5,6.8,0,Platforms,Mercury,Mercury,phone,5145
+2023-08-01,8,3,23,0,23,3.7,7.1,0,Platforms,Appraisal Scope,Appraisal Scope,phone,242
+2023-08-01,8,3,23,0,23,3.7,7.1,0,Platforms,Closing Corp,CLP,phone,301
+2023-08-01,8,3,23,0,23,3.7,7.1,0,Platforms,FNC - CMS,FNC - CMS,phone,189
+2023-08-01,8,3,23,0,23,3.7,7.1,0,Platforms,FNC - Ports,FNC - Ports,phone,1662
+2023-08-01,8,3,23,0,23,3.7,7.1,0,Platforms,Mercury,Mercury,phone,6173
+2023-09-01,9,3,21,1,20,3.8,7.2,0,Platforms,Appraisal Scope,Appraisal Scope,phone,255
+2023-09-01,9,3,21,1,20,3.8,7.2,0,Platforms,Closing Corp,CLP,phone,202
+2023-09-01,9,3,21,1,20,3.8,7.2,0,Platforms,FNC - CMS,FNC - CMS,phone,137
+2023-09-01,9,3,21,1,20,3.8,7.2,0,Platforms,FNC - Ports,FNC - Ports,phone,1270
+2023-09-01,9,3,21,1,20,3.8,7.2,0,Platforms,Mercury,Mercury,phone,5157
+2023-10-01,10,4,22,0,22,3.9,7.6,0,Platforms,Appraisal Scope,Appraisal Scope,phone,266
+2023-10-01,10,4,22,0,22,3.9,7.6,0,Platforms,Closing Corp,CLP,phone,194
+2023-10-01,10,4,22,0,22,3.9,7.6,0,Platforms,FNC - CMS,FNC - CMS,phone,160
+2023-10-01,10,4,22,0,22,3.9,7.6,0,Platforms,FNC - Ports,FNC - Ports,phone,1197
+2023-10-01,10,4,22,0,22,3.9,7.6,0,Platforms,Mercury,Mercury,phone,4777
+2023-11-01,11,4,22,2,20,3.7,7.4,0,Platforms,Appraisal Scope,Appraisal Scope,phone,222
+2023-11-01,11,4,22,2,20,3.7,7.4,0,Platforms,Closing Corp,CLP,phone,208
+2023-11-01,11,4,22,2,20,3.7,7.4,0,Platforms,FNC - CMS,FNC - CMS,phone,128
+2023-11-01,11,4,22,2,20,3.7,7.4,0,Platforms,FNC - Ports,FNC - Ports,phone,1049
+2023-11-01,11,4,22,2,20,3.7,7.4,0,Platforms,Mercury,Mercury,phone,4370
+2023-12-01,12,4,21,1,20,3.8,6.8,0,Platforms,Appraisal Scope,Appraisal Scope,phone,183
+2023-12-01,12,4,21,1,20,3.8,6.8,0,Platforms,Closing Corp,CLP,phone,199
+2023-12-01,12,4,21,1,20,3.8,6.8,0,Platforms,FNC - CMS,FNC - CMS,phone,127
+2023-12-01,12,4,21,1,20,3.8,6.8,0,Platforms,FNC - Ports,FNC - Ports,phone,1098
+2023-12-01,12,4,21,1,20,3.8,6.8,0,Platforms,Mercury,Mercury,phone,4296
+2024-01-01,1,1,23,2,21,3.7,6.6,0,Platforms,Appraisal Scope,Appraisal Scope,phone,154
+2024-01-01,1,1,23,2,21,3.7,6.6,0,Platforms,Closing Corp,CLP,phone,289
+2024-01-01,1,1,23,2,21,3.7,6.6,0,Platforms,FNC - CMS,FNC - CMS,phone,194
+2024-01-01,1,1,23,2,21,3.7,6.6,0,Platforms,FNC - Ports,FNC - Ports,phone,1317
+2024-01-01,1,1,23,2,21,3.7,6.6,0,Platforms,Mercury,Mercury,phone,5332
+2024-02-01,2,1,21,1,20,3.9,6.8,0,Platforms,Appraisal Scope,Appraisal Scope,phone,139
+2024-02-01,2,1,21,1,20,3.9,6.8,0,Platforms,Closing Corp,CLP,phone,253
+2024-02-01,2,1,21,1,20,3.9,6.8,0,Platforms,FNC - CMS,FNC - CMS,phone,280
+2024-02-01,2,1,21,1,20,3.9,6.8,0,Platforms,FNC - Ports,FNC - Ports,phone,1241
+2024-02-01,2,1,21,1,20,3.9,6.8,0,Platforms,Mercury,Mercury,phone,4899
+2024-03-01,3,1,21,1,20,3.9,6.8,0,Platforms,Appraisal Scope,Appraisal Scope,phone,127
+2024-03-01,3,1,21,1,20,3.9,6.8,0,Platforms,Closing Corp,CLP,phone,231
+2024-03-01,3,1,21,1,20,3.9,6.8,0,Platforms,FNC - CMS,FNC - CMS,phone,344
+2024-03-01,3,1,21,1,20,3.9,6.8,0,Platforms,FNC - Ports,FNC - Ports,phone,1158
+2024-03-01,3,1,21,1,20,3.9,6.8,0,Platforms,Mercury,Mercury,phone,5046
+2024-04-01,4,2,22,0,22,3.9,7,0,Platforms,Appraisal Scope,Appraisal Scope,phone,146
+2024-04-01,4,2,22,0,22,3.9,7,0,Platforms,Closing Corp,CLP,phone,192
+2024-04-01,4,2,22,0,22,3.9,7,0,Platforms,FNC - CMS,FNC - CMS,phone,359
+2024-04-01,4,2,22,0,22,3.9,7,0,Platforms,FNC - Ports,FNC - Ports,phone,1183
+2024-04-01,4,2,22,0,22,3.9,7,0,Platforms,Mercury,Mercury,phone,4608
+2024-05-01,5,2,23,0,23,4,7.1,0,Platforms,Appraisal Scope,Appraisal Scope,phone,133
+2024-05-01,5,2,23,0,23,4,7.1,0,Platforms,Closing Corp,CLP,phone,148
+2024-05-01,5,2,23,0,23,4,7.1,0,Platforms,FNC - CMS,FNC - CMS,phone,406
+2024-05-01,5,2,23,0,23,4,7.1,0,Platforms,FNC - Ports,FNC - Ports,phone,1113
+2024-05-01,5,2,23,0,23,4,7.1,0,Platforms,Mercury,Mercury,phone,3624
+2024-06-01,6,2,20,1,19,4.1,6.9,0,Platforms,Appraisal Scope,Appraisal Scope,phone,112
+2024-06-01,6,2,20,1,19,4.1,6.9,0,Platforms,Closing Corp,CLP,phone,172
+2024-06-01,6,2,20,1,19,4.1,6.9,0,Platforms,FNC - CMS,FNC - CMS,phone,331
+2024-06-01,6,2,20,1,19,4.1,6.9,0,Platforms,FNC - Ports,FNC - Ports,phone,1089
+2024-06-01,6,2,20,1,19,4.1,6.9,0,Platforms,Mercury,Mercury,phone,3796
+2024-07-01,7,3,23,1,22,4.2,6.8,0,Platforms,Appraisal Scope,Appraisal Scope,phone,117
+2024-07-01,7,3,23,1,22,4.2,6.8,0,Platforms,Closing Corp,CLP,phone,140
+2024-07-01,7,3,23,1,22,4.2,6.8,0,Platforms,FNC - CMS,FNC - CMS,phone,364
+2024-07-01,7,3,23,1,22,4.2,6.8,0,Platforms,FNC - Ports,FNC - Ports,phone,1239
+2024-07-01,7,3,23,1,22,4.2,6.8,0,Platforms,Mercury,Mercury,phone,3888
+2024-08-01,8,3,22,0,22,4.2,6.5,0,Platforms,Appraisal Scope,Appraisal Scope,phone,122
+2024-08-01,8,3,22,0,22,4.2,6.5,0,Platforms,Closing Corp,CLP,phone,177
+2024-08-01,8,3,22,0,22,4.2,6.5,0,Platforms,FNC - CMS,FNC - CMS,phone,356
+2024-08-01,8,3,22,0,22,4.2,6.5,0,Platforms,FNC - Ports,FNC - Ports,phone,1244
+2024-08-01,8,3,22,0,22,4.2,6.5,0,Platforms,Mercury,Mercury,phone,3628
+2024-09-01,9,3,21,1,20,4.1,6.2,0,Platforms,Appraisal Scope,Appraisal Scope,phone,96
+2024-09-01,9,3,21,1,20,4.1,6.2,0,Platforms,Closing Corp,CLP,phone,177
+2024-09-01,9,3,21,1,20,4.1,6.2,0,Platforms,FNC - CMS,FNC - CMS,phone,448
+2024-09-01,9,3,21,1,20,4.1,6.2,0,Platforms,FNC - Ports,FNC - Ports,phone,1254
+2024-09-01,9,3,21,1,20,4.1,6.2,0,Platforms,Mercury,Mercury,phone,3177
+2024-10-01,10,4,23,0,23,4.1,6.4,0,Platforms,Appraisal Scope,Appraisal Scope,phone,115
+2024-10-01,10,4,23,0,23,4.1,6.4,0,Platforms,Closing Corp,CLP,phone,243
+2024-10-01,10,4,23,0,23,4.1,6.4,0,Platforms,FNC - CMS,FNC - CMS,phone,244
+2024-10-01,10,4,23,0,23,4.1,6.4,0,Platforms,FNC - Ports,FNC - Ports,phone,1298
+2024-10-01,10,4,23,0,23,4.1,6.4,0,Platforms,Mercury,Mercury,phone,4033
+2024-11-01,11,4,21,2,19,4.2,6.8,0,Platforms,Appraisal Scope,Appraisal Scope,phone,86
+2024-11-01,11,4,21,2,19,4.2,6.8,0,Platforms,Closing Corp,CLP,phone,186
+2024-11-01,11,4,21,2,19,4.2,6.8,0,Platforms,FNC - CMS,FNC - CMS,phone,207
+2024-11-01,11,4,21,2,19,4.2,6.8,0,Platforms,FNC - Ports,FNC - Ports,phone,1255
+2024-11-01,11,4,21,2,19,4.2,6.8,0,Platforms,Mercury,Mercury,phone,3133
+2024-12-01,12,4,22,2,20,4.1,6.7,0,Platforms,Appraisal Scope,Appraisal Scope,phone,124
+2024-12-01,12,4,22,2,20,4.1,6.7,0,Platforms,Closing Corp,CLP,phone,219
+2024-12-01,12,4,22,2,20,4.1,6.7,0,Platforms,FNC - CMS,FNC - CMS,phone,210
+2024-12-01,12,4,22,2,20,4.1,6.7,0,Platforms,FNC - Ports,FNC - Ports,phone,1152
+2024-12-01,12,4,22,2,20,4.1,6.7,0,Platforms,Mercury,Mercury,phone,2101
+2025-01-01,1,1,23,2,21,0,7,0.34,Platforms,Appraisal Scope,Appraisal Scope,phone,98
+2025-01-01,1,1,23,2,21,0,7,0.34,Platforms,Closing Corp,CLP,phone,209
+2025-01-01,1,1,23,2,21,0,7,0.34,Platforms,FNC - CMS,FNC - CMS,phone,154
+2025-01-01,1,1,23,2,21,0,7,0.34,Platforms,FNC - Ports,FNC - Ports,phone,965
+2025-01-01,1,1,23,2,21,0,7,0.34,Platforms,Mercury,Mercury,phone,970
+2025-02-01,2,1,20,1,19,0,0,0.4,Platforms,Appraisal Scope,Appraisal Scope,phone,0
+2025-02-01,2,1,20,1,19,0,0,0.4,Platforms,Closing Corp,CLP,phone,0
+2025-02-01,2,1,20,1,19,0,0,0.4,Platforms,FNC - CMS,FNC - CMS,phone,0
+2025-02-01,2,1,20,1,19,0,0,0.4,Platforms,FNC - Ports,FNC - Ports,phone,0
+2025-02-01,2,1,20,1,19,0,0,0.4,Platforms,Mercury,Mercury,phone,0
+2025-03-01,3,1,21,1,20,0,0,0.51,Platforms,Appraisal Scope,Appraisal Scope,phone,0
+2025-03-01,3,1,21,1,20,0,0,0.51,Platforms,Closing Corp,CLP,phone,0
+2025-03-01,3,1,21,1,20,0,0,0.51,Platforms,FNC - CMS,FNC - CMS,phone,0
+2025-03-01,3,1,21,1,20,0,0,0.51,Platforms,FNC - Ports,FNC - Ports,phone,0
+2025-03-01,3,1,21,1,20,0,0,0.51,Platforms,Mercury,Mercury,phone,0
+2025-04-01,4,2,22,0,22,0,0,0.41,Platforms,Appraisal Scope,Appraisal Scope,phone,0
+2025-04-01,4,2,22,0,22,0,0,0.41,Platforms,Closing Corp,CLP,phone,0
+2025-04-01,4,2,22,0,22,0,0,0.41,Platforms,FNC - CMS,FNC - CMS,phone,0
+2025-04-01,4,2,22,0,22,0,0,0.41,Platforms,FNC - Ports,FNC - Ports,phone,0
+2025-04-01,4,2,22,0,22,0,0,0.41,Platforms,Mercury,Mercury,phone,0
+2025-05-01,5,2,22,0,22,0,0,0.52,Platforms,Appraisal Scope,Appraisal Scope,phone,0
+2025-05-01,5,2,22,0,22,0,0,0.52,Platforms,Closing Corp,CLP,phone,0
+2025-05-01,5,2,22,0,22,0,0,0.52,Platforms,FNC - CMS,FNC - CMS,phone,0
+2025-05-01,5,2,22,0,22,0,0,0.52,Platforms,FNC - Ports,FNC - Ports,phone,0
+2025-05-01,5,2,22,0,22,0,0,0.52,Platforms,Mercury,Mercury,phone,0
+2025-06-01,6,2,21,1,20,0,0,0.53,Platforms,Appraisal Scope,Appraisal Scope,phone,0
+2025-06-01,6,2,21,1,20,0,0,0.53,Platforms,Closing Corp,CLP,phone,0
+2025-06-01,6,2,21,1,20,0,0,0.53,Platforms,FNC - CMS,FNC - CMS,phone,0
+2025-06-01,6,2,21,1,20,0,0,0.53,Platforms,FNC - Ports,FNC - Ports,phone,0
+2025-06-01,6,2,21,1,20,0,0,0.53,Platforms,Mercury,Mercury,phone,0
+2025-07-01,7,3,23,1,22,0,0,0.24,Platforms,Appraisal Scope,Appraisal Scope,phone,0
+2025-07-01,7,3,23,1,22,0,0,0.24,Platforms,Closing Corp,CLP,phone,0
+2025-07-01,7,3,23,1,22,0,0,0.24,Platforms,FNC - CMS,FNC - CMS,phone,0
+2025-07-01,7,3,23,1,22,0,0,0.24,Platforms,FNC - Ports,FNC - Ports,phone,0
+2025-07-01,7,3,23,1,22,0,0,0.24,Platforms,Mercury,Mercury,phone,0
+2025-08-01,8,3,21,0,21,0,0,0.23,Platforms,Appraisal Scope,Appraisal Scope,phone,0
+2025-08-01,8,3,21,0,21,0,0,0.23,Platforms,Closing Corp,CLP,phone,0
+2025-08-01,8,3,21,0,21,0,0,0.23,Platforms,FNC - CMS,FNC - CMS,phone,0
+2025-08-01,8,3,21,0,21,0,0,0.23,Platforms,FNC - Ports,FNC - Ports,phone,0
+2025-08-01,8,3,21,0,21,0,0,0.23,Platforms,Mercury,Mercury,phone,0
+2025-09-01,9,3,22,1,21,0,0,0.2,Platforms,Appraisal Scope,Appraisal Scope,phone,0
+2025-09-01,9,3,22,1,21,0,0,0.2,Platforms,Closing Corp,CLP,phone,0
+2025-09-01,9,3,22,1,21,0,0,0.2,Platforms,FNC - CMS,FNC - CMS,phone,0
+2025-09-01,9,3,22,1,21,0,0,0.2,Platforms,FNC - Ports,FNC - Ports,phone,0
+2025-09-01,9,3,22,1,21,0,0,0.2,Platforms,Mercury,Mercury,phone,0
+2025-10-01,10,4,23,0,23,0,0,0.16,Platforms,Appraisal Scope,Appraisal Scope,phone,0
+2025-10-01,10,4,23,0,23,0,0,0.16,Platforms,Closing Corp,CLP,phone,0
+2025-10-01,10,4,23,0,23,0,0,0.16,Platforms,FNC - CMS,FNC - CMS,phone,0
+2025-10-01,10,4,23,0,23,0,0,0.16,Platforms,FNC - Ports,FNC - Ports,phone,0
+2025-10-01,10,4,23,0,23,0,0,0.16,Platforms,Mercury,Mercury,phone,0
+2025-11-01,11,4,20,2,18,0,0,0.12,Platforms,Appraisal Scope,Appraisal Scope,phone,0
+2025-11-01,11,4,20,2,18,0,0,0.12,Platforms,Closing Corp,CLP,phone,0
+2025-11-01,11,4,20,2,18,0,0,0.12,Platforms,FNC - CMS,FNC - CMS,phone,0
+2025-11-01,11,4,20,2,18,0,0,0.12,Platforms,FNC - Ports,FNC - Ports,phone,0
+2025-11-01,11,4,20,2,18,0,0,0.12,Platforms,Mercury,Mercury,phone,0
+2025-12-01,12,4,23,2,21,0,0,0.17,Platforms,Appraisal Scope,Appraisal Scope,phone,0
+2025-12-01,12,4,23,2,21,0,0,0.17,Platforms,Closing Corp,CLP,phone,0
+2025-12-01,12,4,23,2,21,0,0,0.17,Platforms,FNC - CMS,FNC - CMS,phone,0
+2025-12-01,12,4,23,2,21,0,0,0.17,Platforms,FNC - Ports,FNC - Ports,phone,0
+2025-12-01,12,4,23,2,21,0,0,0.17,Platforms,Mercury,Mercury,phone,0
+2026-01-01,1,1,22,0,22,0,0,0,Platforms,Appraisal Scope,Appraisal Scope,phone,0
+2026-01-01,1,1,22,0,22,0,0,0,Platforms,Closing Corp,CLP,phone,0
+2026-01-01,1,1,22,0,22,0,0,0,Platforms,FNC - CMS,FNC - CMS,phone,0
+2026-01-01,1,1,22,0,22,0,0,0,Platforms,FNC - Ports,FNC - Ports,phone,0
+2026-01-01,1,1,22,0,22,0,0,0,Platforms,Mercury,Mercury,phone,0
+2026-02-01,2,1,2,0,2,0,0,0,Platforms,Appraisal Scope,Appraisal Scope,phone,0
+2026-02-01,2,1,2,0,2,0,0,0,Platforms,Closing Corp,CLP,phone,0
+2026-02-01,2,1,2,0,2,0,0,0,Platforms,FNC - CMS,FNC - CMS,phone,0
+2026-02-01,2,1,2,0,2,0,0,0,Platforms,FNC - Ports,FNC - Ports,phone,0
+2026-02-01,2,1,2,0,2,0,0,0,Platforms,Mercury,Mercury,phone,0
