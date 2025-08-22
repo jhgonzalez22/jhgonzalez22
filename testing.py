@@ -306,7 +306,7 @@ def model_and_forecast(df: pd.DataFrame, drv_df: pd.DataFrame):
         ts = client_df['total_cases_opened']
 
         if len(ts) < (MAX_LAGS + VAL_LEN_6M + 1):
-            logger.info("· Skip %-25s – only %d pts", cid, len(ts))
+            logger.info(f"· Skip {cid:<25} – only {len(ts)} pts")
             continue
 
         # Supervised lag frame for ML models
@@ -336,7 +336,7 @@ def model_and_forecast(df: pd.DataFrame, drv_df: pd.DataFrame):
         feat = feat.dropna(subset=core_cols).copy()
 
         if len(feat) < (VAL_LEN_6M + 1):
-            logger.info("· Skip %-25s – not enough post-lag rows", cid)
+            logger.info(f"· Skip {cid:<25} – not enough post-lag rows")
             continue
         train_6m, valid_6m = feat.iloc[:-VAL_LEN_6M], feat.iloc[-VAL_LEN_6M:]
         train_3m, valid_3m = feat.iloc[:-VAL_LEN_3M], feat.iloc[-VAL_LEN_3M:]
@@ -464,7 +464,7 @@ def model_and_forecast(df: pd.DataFrame, drv_df: pd.DataFrame):
                 preds_6m['WeightedLagBlendDrv'] = wlbdrv_block_preds(valid_6m.index, best_lam)
                 extras['WeightedLagBlendDrv'] = {"lambda": best_lam, "r_drv": r_drv}
         else:
-            logger.info("· %-25s WLB+Drivers skipped (no/insufficient drivers)", cid)
+            logger.info(f"· {cid:<25} WLB+Drivers skipped (no/insufficient drivers)")
 
         # ---------- NEW: Case2OrderRatio ----------
         # Build ratio = cases / orders; needs TotalOrders in client_drivers on the same index as 'ts'
@@ -532,9 +532,9 @@ def model_and_forecast(df: pd.DataFrame, drv_df: pd.DataFrame):
                         preds_6m['Case2OrderRatio'] = predict_tickets(r_val_6.index, best_w)
                         extras['Case2OrderRatio'] = {"w_r_lag1": best_w[0], "w_r_lag12": best_w[1], "w_r_lag24": best_w[2]}
             else:
-                logger.info("· %-25s Case2OrderRatio skipped (insufficient ratio history)", cid)
+                logger.info(f"· {cid:<25} Case2OrderRatio skipped (insufficient ratio history)")
         else:
-            logger.info("· %-25s Case2OrderRatio skipped (no TotalOrders driver)", cid)
+            logger.info(f"· {cid:<25} Case2OrderRatio skipped (no TotalOrders driver)")
 
         # ---------- Evaluate & select winner ----------
         models_to_score = list(preds_3m.keys())
@@ -573,7 +573,7 @@ def model_and_forecast(df: pd.DataFrame, drv_df: pd.DataFrame):
             audit_rows.append(row)
 
         if not smapes_3:
-            logger.info("· %-25s – no valid (all-finite) predictions on 3m val", cid)
+            logger.info(f"· {cid:<25} – no valid (all-finite) predictions on 3m val")
             continue
 
         best_model = min(smapes_3, key=smapes_3.get)
@@ -813,15 +813,14 @@ def model_and_forecast(df: pd.DataFrame, drv_df: pd.DataFrame):
     xgb_imp_df.to_csv(XGB_VIZ_CSV, index=False)
     if not drv_fc_df.empty:
         drv_fc_df.to_csv(DRV_FC_CSV, index=False)
-    logger.info("✓ CSVs saved to\n    %s\n    %s\n    %s\n    %s",
-                LOCAL_CSV, AUDIT_CSV, XGB_VIZ_CSV, DRV_FC_CSV)
+    logger.info(f"✓ CSVs saved to\n    {LOCAL_CSV}\n    {AUDIT_CSV}\n    {XGB_VIZ_CSV}\n    {DRV_FC_CSV}")
 
     return fx_df, audit_df, xgb_imp_df, drv_fc_df
 
 def push_results(fx_df: pd.DataFrame):
     """Optionally push to GBQ + inactivate old rows (skipped in TEST)."""
     if PUSH_TO_GBQ:
-        logger.info("Pushing %d rows to %s …", len(fx_df), DEST_TABLE)
+        logger.info(f"Pushing {len(fx_df)} rows to {DEST_TABLE} …")
         ok = bigquery_manager.import_data_to_bigquery(
                 fx_df, DEST_TABLE, gbq_insert_action="append", auto_convert_df=True)
         if not ok:
