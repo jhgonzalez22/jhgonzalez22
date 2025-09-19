@@ -1,31 +1,36 @@
 """
-CX Platforms – Ticket-volume forecast (PROD) — v10.2 (Final Combined)
+CX Platforms – Ticket-volume forecast (PROD) — v10.3 (Final Combined)
 
-Models per client_id (per BU):
+Model roster (per client_id / BU):
   • XGBoost (log-space)           — Tree regressor on all available features. Used for feature selection.
   • Ridge (log-space)             — Linear regressor on XGBoost-selected features.
   • Lasso (log-space)             — Sparse linear regressor on XGBoost-selected features.
   • OLS_Simple (log-space)        — Simple linear regressor on TotalOrders and month.
   • OLS_TotalOrdersOnly           — OLS on TotalOrders only (no seasonal terms).
-  • OLS_DriverLags                — OLS on driver lags (e.g., drv_lag_1,3,6,12 [+ month if available]).
-  • Ridge_DriverLags              — Ridge on driver lags (e.g., drv_lag_1,3,6,12 [+ month if available]).
+  • OLS_DriverLags                — OLS on driver lags (drv_lag_1,3,6,12 [+ month if available]).
+  • Ridge_DriverLags              — Ridge on driver lags (drv_lag_1,3,6,12 [+ month if available]).
   • WeightedLagBlend              — Convex blend of {lag3, lag6, lag12}; weights tuned on 6m SMAPE.
   • SeasonalNaive3mGR             — Seasonal naive (t−12) scaled by recent 3-month YoY growth on target.
   • WeightedLagBlendDrv           — WLB blended with a seasonal+driver bump.
 
+Model selection:
+  • Primary criterion: lowest 6-month SMAPE.
+  • Constraint: chosen model must be ≥ 5.0 SMAPE points LOWER than OLS_TotalOrdersOnly.
+    If no model satisfies this, select OLS_TotalOrdersOnly.
+
 Statistical Pre-Checks (per client):
-  • Stationarity: Augmented Dickey–Fuller (ADF) test on the target variable.
-  • Correlation: Pearson correlation test for all potential predictors against the target.
+  • Stationarity: Augmented Dickey–Fuller (ADF) test on target.
+  • Correlation: Pearson correlation for candidate predictors vs target.
 
 Outputs:
   • Append 15-month forecasts to GBQ and inactivate older rows.
   • Local CSVs:
       - forecast_results.csv
-      - model_eval_debug.csv (enriched with model diagnostics)
-      - statistical_tests.csv (detailed results of all statistical tests per client)
-      - xgb_feature_importance.csv (full feature importance from XGBoost)
-      - modeling_data.csv (the final data used for training and validation)
-      - model_summaries.txt (full statistical summaries for all fitted models)
+      - model_eval_debug.csv (diagnostics)
+      - statistical_tests.csv (ADF + correlations)
+      - xgb_feature_importance.csv
+      - modeling_data.csv (train/val data)
+      - model_summaries.txt (OLS summaries)
   • Write success run-log to GBQ.
 """
 
@@ -50,19 +55,16 @@ from scipy.stats import pearsonr
 warnings.filterwarnings("ignore")  # keep logs tidy
 
 # ------------------- helper-package path --------------------
-# This allows the script to import custom modules from a specified directory.
 sys.path.append(r"C:\WFM_Scripting\Automation")  # adjust if needed
 from scripthelper import Config, Logger, BigQueryManager, EmailManager
 
 # ------------------- initialise scripthelper ---------------
-# Sets up configuration, logging, and connections for BigQuery and email.
 config             = Config(rpt_id=284)
 logger             = Logger(config)
 email_manager      = EmailManager(config)
 bigquery_manager   = BigQueryManager(config)
 
 # ------------------- file / table paths --------------------
-# Defines the location of the input SQL query and output tables/files.
 SQL_QUERY_PATH = (r"C:\WFM_Scripting\Forecasting"
                   r"\GBQ - Non-Tax Platform Ticket Timeseries by Month.sql")
 
@@ -85,6 +87,7 @@ STAMP              = datetime.now(pytz.timezone("America/Chicago"))
 DRV_ALPHA_PROFILE  = [0.50, 0.30, 0.20]
 DRV_ALPHA_STR      = "0.50/0.30/0.20"
 LAMBDA_GRID        = np.arange(0.50, 0.95, 0.05)
+DELTA_VS_OLS_TO    = 5.0  # minimum 6m SMAPE improvement required over OLS_TotalOrdersOnly
 
 # Maps model names to prefixes for the forecast ID.
 FX_ID_PREFIX = {
@@ -186,7 +189,6 @@ def fetch_workload_drivers(bq: BigQueryManager) -> pd.DataFrame:
         if df.empty:
             return pd.DataFrame(columns=["date", "client_id", "TotalOrders"])
         logger.info(f"✓ Drivers pulled: {len(df):,} rows")
-        # Normalize client labels if needed
         df['client_id'] = df['client_id'].replace({
             'FNC - CMS': 'FNC',
             'FNC - Ports': 'FNC',
@@ -367,7 +369,7 @@ try:
                 preds_3m['OLS_Simple'] = safe_expm1(ols_simple_model.predict(X_val_3_simple))
                 preds_6m['OLS_Simple'] = safe_expm1(ols_simple_model.predict(X_val_6_simple))
 
-        # ------------------- NEW: OLS_TotalOrdersOnly -------------------
+        # ------------------- OLS_TotalOrdersOnly -------------------
         if 'TotalOrders' in X_tr_6.columns and not X_tr_6['TotalOrders'].isnull().all():
             y_to = np.log1p(y_tr_6).astype(float).rename('y')
             X_to = X_tr_6[['TotalOrders']].astype(float)
@@ -383,7 +385,7 @@ try:
                 preds_3m['OLS_TotalOrdersOnly'] = safe_expm1(ols_to_model.predict(X_val_3_arr))
                 preds_6m['OLS_TotalOrdersOnly'] = safe_expm1(ols_to_model.predict(X_val_6_arr))
 
-        # ------------------- NEW: OLS_DriverLags & Ridge_DriverLags -------------------
+        # ------------------- OLS_DriverLags & Ridge_DriverLags -------------------
         driver_lag_candidates = ['drv_lag_1','drv_lag_3','drv_lag_6','drv_lag_12','month']
         drv_cols_used = [c for c in driver_lag_candidates if c in X_tr_6.columns and not X_tr_6[c].isnull().all()]
         if len(drv_cols_used) >= 1:
@@ -486,16 +488,18 @@ try:
         else:
             logger.info(f"· {cid:<25} WLB+Drivers skipped (no finite driver growth)")
 
-        # ------------------- Select winner on 3m SMAPE -------------------
+        # ------------------- Score models (store 6m SMAPE for selection) -------------------
         if not preds_3m:
             logger.info(f"· {cid:<25} – no models could be fitted.")
             continue
 
-        # Score all models
         models_to_score = list(preds_3m.keys())
+        scores_6m = {}  # model -> 6m SMAPE
+
         for m in models_to_score:
             met3 = safe_reg_metrics(y_val_3.values, preds_3m.get(m))
             met6 = safe_reg_metrics(y_val_6.values, preds_6m.get(m))
+            scores_6m[m] = met6['smape']
             row = dict(
                 client_id=cid, model=m, val_smape_3m=met3['smape'], val_smape_6m=met6['smape'],
                 MAPE_3m=met3['mape'], RMSE_3m=met3['rmse'], alpha_profile=DRV_ALPHA_STR
@@ -504,11 +508,23 @@ try:
                 row.update(extras[m])
             audit_rows.append(row)
 
-        # Winner
-        smapes_3 = {m: smape(y_val_3, p) for m, p in preds_3m.items() if p is not None and np.isfinite(p).any()}
-        if not smapes_3:
+        # ------------------- Select winner on 6m SMAPE w/ baseline constraint -------------------
+        finite_candidates = {m: s for m, s in scores_6m.items() if np.isfinite(s)}
+        if not finite_candidates:
             continue
-        best_model = min(smapes_3, key=smapes_3.get)
+
+        # Best by 6m SMAPE
+        best_model = min(finite_candidates, key=finite_candidates.get)
+        best_smape6 = finite_candidates[best_model]
+
+        # Baseline constraint vs OLS_TotalOrdersOnly
+        if 'OLS_TotalOrdersOnly' in finite_candidates:
+            baseline = finite_candidates['OLS_TotalOrdersOnly']
+            # If best model doesn't beat baseline by >= DELTA_VS_OLS_TO, use baseline
+            if best_model != 'OLS_TotalOrdersOnly' and not (best_smape6 <= baseline - DELTA_VS_OLS_TO):
+                best_model = 'OLS_TotalOrdersOnly'
+                best_smape6 = baseline
+
         for r in audit_rows[-len(models_to_score):]:
             r["winner_model"] = best_model
         model_parameters.append({"client_id": cid, "model_name": best_model, "params": extras.get(best_model, {})})
@@ -615,8 +631,7 @@ try:
 
             # advance histories
             hist.append(pred)
-            drv_hist.append(last_total_orders)  # carry-forward driver to generate future drv_lag_*
-
+            drv_hist.append(last_total_orders)  # carry-forward driver for future drv_lag_*
             append_fx(d, pred)
 
     # ------------------- Write outputs -------------------
@@ -663,7 +678,6 @@ try:
         modeling_df.to_csv(MODELING_DATA_CSV, index=True)
         logger.info(f"✓ Modeling data saved to\n    {MODELING_DATA_CSV}")
 
-    # Keep if your current scripthelper expects it
     bigquery_manager.update_log_in_bigquery()
     logger.info("✓ Ticket forecasting (PROD) completed successfully")
 
