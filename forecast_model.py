@@ -1,14 +1,17 @@
 """
-CX Platforms – Ticket-volume forecast (PROD) — v10.1 (Final Combined)
+CX Platforms – Ticket-volume forecast (PROD) — v10.2 (Final Combined)
 
 Models per client_id (per BU):
-  • XGBoost (log-space)       — Tree regressor on all available features. Used for feature selection.
-  • Ridge (log-space)         — Linear regressor on XGBoost-selected features.
-  • Lasso (log-space)         — Sparse linear regressor on XGBoost-selected features.
-  • OLS_Simple (log-space)    — Simple linear regressor on TotalOrders and month.
-  • WeightedLagBlend          — Convex blend of {lag3, lag6, lag12}; weights tuned on 6m SMAPE.
-  • SeasonalNaive3mGR         — Seasonal naive (t−12) scaled by recent 3-month YoY growth on target.
-  • WeightedLagBlendDrv       — WLB blended with a seasonal+driver bump.
+  • XGBoost (log-space)           — Tree regressor on all available features. Used for feature selection.
+  • Ridge (log-space)             — Linear regressor on XGBoost-selected features.
+  • Lasso (log-space)             — Sparse linear regressor on XGBoost-selected features.
+  • OLS_Simple (log-space)        — Simple linear regressor on TotalOrders and month.
+  • OLS_TotalOrdersOnly           — OLS on TotalOrders only (no seasonal terms).
+  • OLS_DriverLags                — OLS on driver lags (e.g., drv_lag_1,3,6,12 [+ month if available]).
+  • Ridge_DriverLags              — Ridge on driver lags (e.g., drv_lag_1,3,6,12 [+ month if available]).
+  • WeightedLagBlend              — Convex blend of {lag3, lag6, lag12}; weights tuned on 6m SMAPE.
+  • SeasonalNaive3mGR             — Seasonal naive (t−12) scaled by recent 3-month YoY growth on target.
+  • WeightedLagBlendDrv           — WLB blended with a seasonal+driver bump.
 
 Statistical Pre-Checks (per client):
   • Stationarity: Augmented Dickey–Fuller (ADF) test on the target variable.
@@ -89,6 +92,9 @@ FX_ID_PREFIX = {
     "Ridge": "ridge_ticket",
     "Lasso": "lasso_ticket",
     "OLS_Simple": "ols_simple_ticket",
+    "OLS_TotalOrdersOnly": "ols_to_ticket",
+    "OLS_DriverLags": "ols_drv_ticket",
+    "Ridge_DriverLags": "ridge_drv_ticket",
     "WeightedLagBlend": "wlb_ticket",
     "SeasonalNaive3mGR": "seasonal_naive3mgr_ticket",
     "WeightedLagBlendDrv": "wlbdrv_ticket"
@@ -136,8 +142,10 @@ def perform_statistical_tests(client_data: pd.DataFrame):
 
     target = client_data['total_cases_opened']
     correlations = {}
-    potential_predictors = [col for col in client_data.columns
-                            if col.startswith('lag_') or col in ['sin_month', 'cos_month', 'TotalOrders']]
+    potential_predictors = [
+        col for col in client_data.columns
+        if col.startswith('lag_') or col.startswith('drv_lag_') or col in ['sin_month', 'cos_month', 'TotalOrders']
+    ]
     for col in potential_predictors:
         predictor = client_data[col]
         mask = target.notna() & predictor.notna()
@@ -161,7 +169,7 @@ def perform_statistical_tests(client_data: pd.DataFrame):
     if correlations:
         for feature, values in sorted(correlations.items(), key=lambda item: item[1]['p_value']):
             is_sig = '(*)' if values['p_value'] < 0.05 else ''
-            logger.info(f"{feature:<20} | {values['correlation']:>12.4f} | {values['p_value']:>10.4f} {is_sig}")
+            logger.info(f"{feature:<20} | {values['correlation']:>12.4f} | {'%10.4f'%values['p_value']} {is_sig}")
     else:
         logger.info("No valid correlations could be computed.")
     return results
@@ -239,9 +247,13 @@ try:
 
     df = df.sort_values(['client_id', 'date'])
 
-    # Lag features
+    # Target lags
     for lag in range(1, MAX_LAGS + 1):
         df[f'lag_{lag}'] = df.groupby('client_id')['total_cases_opened'].shift(lag)
+
+    # Driver lags (TotalOrders)
+    for lag in range(1, MAX_LAGS + 1):
+        df[f'drv_lag_{lag}'] = df.groupby('client_id')['TotalOrders'].shift(lag)
 
     forecasts, audit_rows, model_parameters = [], [], []
     stat_test_results, all_modeling_data = [], []
@@ -251,7 +263,9 @@ try:
         client_df_full = df[df['client_id'] == cid].copy()
 
         # Clean numeric cols
-        cols_to_clean = ['total_cases_opened', 'sin_month', 'cos_month', 'TotalOrders'] + [f'lag_{l}' for l in range(1, MAX_LAGS + 1)]
+        cols_to_clean = (['total_cases_opened','sin_month','cos_month','TotalOrders']
+                         + [f'lag_{l}' for l in range(1, MAX_LAGS + 1)]
+                         + [f'drv_lag_{l}' for l in range(1, MAX_LAGS + 1)])
         for col in cols_to_clean:
             if col in client_df_full.columns:
                 client_df_full[col] = pd.to_numeric(client_df_full[col], errors='coerce')
@@ -265,7 +279,9 @@ try:
 
         # Build feature matrix
         feat = pd.DataFrame({'y': ts})
-        base_cols = ['month', 'sin_month', 'cos_month', 'TotalOrders'] + [f'lag_{l}' for l in range(1, MAX_LAGS + 1)]
+        base_cols = (['month','sin_month','cos_month','TotalOrders']
+                     + [f'lag_{l}' for l in range(1, MAX_LAGS + 1)]
+                     + [f'drv_lag_{l}' for l in range(1, MAX_LAGS + 1)])
         feat = feat.join(client_df[base_cols])
 
         # Optional external lag_12 (if provided)
@@ -274,10 +290,7 @@ try:
         else:
             lag12_ext = pd.Series(dtype=float)
 
-        # Optional date floor (adjust or remove as desired)
-        # feat = feat.loc[feat.index >= '2024-01-01'].copy()
-
-        # Ensure enough history rows contain all required lags
+        # Ensure enough history rows contain target lag history
         feat = feat.dropna(subset=['y'] + [f'lag_{k}' for k in range(1, MAX_LAGS+1)])
         if len(feat) < (VAL_LEN_6M + 1):
             continue
@@ -331,7 +344,7 @@ try:
             preds_3m['Lasso'] = safe_expm1(lasso.predict(X_val_3[good_cols]))
             preds_6m['Lasso'] = safe_expm1(lasso.predict(X_val_6[good_cols]))
 
-        # ------------------- OLS_Simple (force numeric arrays) -------------------
+        # ------------------- OLS_Simple (TO + month) -------------------
         simple_ols_features = ['TotalOrders', 'month']
         if 'TotalOrders' in X_tr_6.columns and not X_tr_6['TotalOrders'].isnull().all():
             y_tr_log_simple = np.log1p(y_tr_6).astype(float)
@@ -353,6 +366,48 @@ try:
                 X_val_6_simple = sm.add_constant(X_val_6[simple_ols_features].astype(float).values, has_constant='add')
                 preds_3m['OLS_Simple'] = safe_expm1(ols_simple_model.predict(X_val_3_simple))
                 preds_6m['OLS_Simple'] = safe_expm1(ols_simple_model.predict(X_val_6_simple))
+
+        # ------------------- NEW: OLS_TotalOrdersOnly -------------------
+        if 'TotalOrders' in X_tr_6.columns and not X_tr_6['TotalOrders'].isnull().all():
+            y_to = np.log1p(y_tr_6).astype(float).rename('y')
+            X_to = X_tr_6[['TotalOrders']].astype(float)
+            df_to = pd.concat([y_to, X_to], axis=1).dropna()
+            if len(df_to) > 5:
+                y_arr = df_to['y'].values
+                X_arr = sm.add_constant(df_to[['TotalOrders']].values, has_constant='add')
+                ols_to_model = sm.OLS(y_arr, X_arr).fit()
+                models['OLS_TotalOrdersOnly'] = ols_to_model
+                extras['OLS_TotalOrdersOnly'] = {"selected_features": ['TotalOrders']}
+                X_val_3_arr = sm.add_constant(X_val_3[['TotalOrders']].astype(float).values, has_constant='add')
+                X_val_6_arr = sm.add_constant(X_val_6[['TotalOrders']].astype(float).values, has_constant='add')
+                preds_3m['OLS_TotalOrdersOnly'] = safe_expm1(ols_to_model.predict(X_val_3_arr))
+                preds_6m['OLS_TotalOrdersOnly'] = safe_expm1(ols_to_model.predict(X_val_6_arr))
+
+        # ------------------- NEW: OLS_DriverLags & Ridge_DriverLags -------------------
+        driver_lag_candidates = ['drv_lag_1','drv_lag_3','drv_lag_6','drv_lag_12','month']
+        drv_cols_used = [c for c in driver_lag_candidates if c in X_tr_6.columns and not X_tr_6[c].isnull().all()]
+        if len(drv_cols_used) >= 1:
+            # OLS on driver lags (+ optional month)
+            y_drv = np.log1p(y_tr_6).astype(float).rename('y')
+            X_drv = X_tr_6[drv_cols_used].astype(float)
+            df_drv = pd.concat([y_drv, X_drv], axis=1).dropna()
+            if len(df_drv) > 5:
+                y_arr = df_drv['y'].values
+                X_arr = sm.add_constant(df_drv[drv_cols_used].values, has_constant='add')
+                ols_drv_model = sm.OLS(y_arr, X_arr).fit()
+                models['OLS_DriverLags'] = ols_drv_model
+                extras['OLS_DriverLags'] = {"selected_features": drv_cols_used}
+                X_val_3_arr = sm.add_constant(X_val_3[drv_cols_used].astype(float).values, has_constant='add')
+                X_val_6_arr = sm.add_constant(X_val_6[drv_cols_used].astype(float).values, has_constant='add')
+                preds_3m['OLS_DriverLags'] = safe_expm1(ols_drv_model.predict(X_val_3_arr))
+                preds_6m['OLS_DriverLags'] = safe_expm1(ols_drv_model.predict(X_val_6_arr))
+
+                # Ridge on driver lags
+                ridge_drv = Ridge().fit(X_tr_6[drv_cols_used], y_tr_log)
+                models['Ridge_DriverLags'] = ridge_drv
+                extras['Ridge_DriverLags'] = {"selected_features": drv_cols_used}
+                preds_3m['Ridge_DriverLags'] = safe_expm1(ridge_drv.predict(X_val_3[drv_cols_used]))
+                preds_6m['Ridge_DriverLags'] = safe_expm1(ridge_drv.predict(X_val_6[drv_cols_used]))
 
         # ------------------- WeightedLagBlend (grid over convex weights) -------------------
         def get_wlb_lags(block_idx):
@@ -475,6 +530,10 @@ try:
 
         hist = deque(ts.tolist(), maxlen=max(24, MAX_LAGS))
 
+        # Build/maintain driver series history for future drv_lag_* computation
+        drv_series = client_df_full['TotalOrders'].tolist() if 'TotalOrders' in client_df_full.columns else []
+        drv_hist = deque([float(x) if pd.notna(x) else np.nan for x in drv_series], maxlen=max(24, MAX_LAGS))
+
         # Hold TotalOrders flat at last observed for this client (until driver forecasts are wired)
         last_total_orders = (
             client_df_full['TotalOrders'].dropna().iloc[-1]
@@ -482,10 +541,14 @@ try:
             else np.nan
         )
 
+        def build_driver_lag_row():
+            return {f'drv_lag_{k}': (drv_hist[-k] if len(drv_hist) >= k else np.nan) for k in range(1, MAX_LAGS + 1)}
+
         for d in future_idx:
             pred = np.nan
-            if best_model in ['Ridge', 'Lasso', 'XGBoost']:
+            if best_model in ['Ridge', 'Lasso', 'XGBoost', 'Ridge_DriverLags']:
                 row = {f'lag_{k}': (hist[-k] if len(hist) >= k else np.nan) for k in range(1, MAX_LAGS + 1)}
+                row.update(build_driver_lag_row())
                 row.update({
                     'month': d.month,
                     'sin_month': np.sin(2*np.pi*d.month/12),
@@ -495,9 +558,14 @@ try:
                 xrow_df = pd.DataFrame([row])
 
                 if best_model in ['Ridge', 'Lasso']:
-                    # Ensure the exact columns used during training
                     xrow_model = xrow_df.reindex(columns=good_cols, fill_value=np.nan)
                     pred = safe_expm1(models[best_model].predict(xrow_model)[0])
+
+                elif best_model == 'Ridge_DriverLags':
+                    drv_cols_used = extras['Ridge_DriverLags']['selected_features']
+                    xrow_model = xrow_df[drv_cols_used]
+                    pred = safe_expm1(models['Ridge_DriverLags'].predict(xrow_model)[0])
+
                 else:  # XGBoost — align to training columns strictly
                     xrow_model = xrow_df.reindex(columns=list(X_tr_6.columns), fill_value=np.nan)
                     pred = safe_expm1(models['XGBoost'].predict(xrow_model)[0])
@@ -506,6 +574,22 @@ try:
                 xrow_simple = np.array([[last_total_orders, d.month]], dtype=float)
                 xrow_simple = sm.add_constant(xrow_simple, has_constant='add')
                 pred = safe_expm1(models['OLS_Simple'].predict(xrow_simple)[0])
+
+            elif best_model == 'OLS_TotalOrdersOnly':
+                xrow_to = sm.add_constant(np.array([[last_total_orders]], dtype=float), has_constant='add')
+                pred = safe_expm1(models['OLS_TotalOrdersOnly'].predict(xrow_to)[0])
+
+            elif best_model == 'OLS_DriverLags':
+                drv_cols_used = extras['OLS_DriverLags']['selected_features']
+                drv_vals = []
+                for c in drv_cols_used:
+                    if c == 'month':
+                        drv_vals.append(float(d.month))
+                    else:
+                        k = int(c.split('_')[-1])
+                        drv_vals.append(float(drv_hist[-k]) if len(drv_hist) >= k else np.nan)
+                X_row = sm.add_constant(np.array([drv_vals], dtype=float), has_constant='add')
+                pred = safe_expm1(models['OLS_DriverLags'].predict(X_row)[0])
 
             elif best_model == 'WeightedLagBlend':
                 p = extras['WeightedLagBlend']
@@ -529,7 +613,10 @@ try:
                 lam  = extras['WeightedLagBlendDrv']['lambda']
                 pred = lam*wlb + (1.0 - lam)*sdrv
 
+            # advance histories
             hist.append(pred)
+            drv_hist.append(last_total_orders)  # carry-forward driver to generate future drv_lag_*
+
             append_fx(d, pred)
 
     # ------------------- Write outputs -------------------
