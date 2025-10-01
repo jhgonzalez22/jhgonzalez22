@@ -192,9 +192,12 @@ def predict_ols_logspace(X: np.ndarray, beta: np.ndarray) -> np.ndarray:
 def arima_val_series(ts: pd.Series, val_index: pd.DatetimeIndex) -> pd.Series:
     """ARIMA(1,1,0) + seasonal AR(1) @ 12 — validation predictions."""
     try:
-        mod = ARIMA(ts.dropna(), order=(1,1,0), seasonal_order=(1,0,0,12))
-        res = mod.fit()
-        # predict over validation index range
+        y = ts.dropna()
+        if len(y) < 18:
+            return pd.Series([np.nan]*len(val_index), index=val_index, dtype=float)
+        mod = ARIMA(y, order=(1,1,0), seasonal_order=(1,0,0,12),
+                    enforce_stationarity=False, enforce_invertibility=False)
+        res = mod.fit(method_kwargs={"warn_convergence": False})
         return pd.Series(res.predict(start=val_index[0], end=val_index[-1]), index=val_index, dtype=float)
     except Exception:
         return pd.Series([np.nan]*len(val_index), index=val_index, dtype=float)
@@ -202,8 +205,11 @@ def arima_val_series(ts: pd.Series, val_index: pd.DatetimeIndex) -> pd.Series:
 def holtwinters_val_series(ts: pd.Series, val_index: pd.DatetimeIndex) -> pd.Series:
     """Holt-Winters additive trend + additive seasonality (12)."""
     try:
-        mod = ExponentialSmoothing(ts.dropna(), trend="add", seasonal="add", seasonal_periods=12)
-        res = mod.fit()
+        y = ts.dropna()
+        if len(y) < 24:
+            return pd.Series([np.nan]*len(val_index), index=val_index, dtype=float)
+        mod = ExponentialSmoothing(y, trend="add", seasonal="add", seasonal_periods=12)
+        res = mod.fit(optimized=True, use_brute=False)
         return pd.Series(res.forecast(len(val_index)), index=val_index, dtype=float)
     except Exception:
         return pd.Series([np.nan]*len(val_index), index=val_index, dtype=float)
@@ -212,11 +218,10 @@ def magr_val_series(ts: pd.Series, val_index: pd.DatetimeIndex) -> pd.Series:
     """Volatility-aware smoothing: MA3 baseline * (1 + recent 3m growth)."""
     out = []
     for d in val_index:
-        # ensure position exists even if value is NaN
         if d not in ts.index:
             out.append(np.nan); continue
         pos = ts.index.get_loc(d)
-        if isinstance(pos, slice):  # should not happen for unique index
+        if isinstance(pos, slice):
             pos = pos.start
         if pos < 6:
             out.append(np.nan); continue
@@ -242,13 +247,18 @@ try:
     forecasts, audit_rows = [], []
 
     for cid, g in wd_df.groupby("client_id", sort=False):
+        # Base monthly series
         ts = g.set_index("date")["target_volume"].asfreq("MS").sort_index()
 
-        # Build lag frame; keep rows with any info (we'll mask per-model)
-        feat = add_lags(ts)
+        # Robust fill for modeling (keeps structure; helps lags/seasonality)
+        ts_model = ts.copy()
+        ts_model = ts_model.ffill().bfill()
+
+        # Build lag frame on filled series
+        feat = add_lags(ts_model)
 
         if feat.shape[0] <= TEST_LEN:
-            logger.info(f"· Skipping {cid:<25} – not enough rows to form a 6-month validation window.")
+            logger.info(f"· Skipping {cid:<25} – not enough rows to form a {TEST_LEN}-month validation window.")
             continue
 
         # Train/Validation split (last 6 months)
@@ -258,10 +268,10 @@ try:
         # -------------------- Predictions dict --------------------
         preds = {}
 
-        # Originals (validation)
-        preds["SeasonalNaive"]         = seasonal_naive_series(ts, val_index)
-        preds["SeasonalNaiveGR"]       = seasonal_naive_gr_series(ts, val_index)
-        preds["SeasonalNaive3mDiffGR"] = seasonal_naive_3m_diff_gr_series(ts, val_index)
+        # Originals (validation) on filled series
+        preds["SeasonalNaive"]         = seasonal_naive_series(ts_model, val_index)
+        preds["SeasonalNaiveGR"]       = seasonal_naive_gr_series(ts_model, val_index)
+        preds["SeasonalNaive3mDiffGR"] = seasonal_naive_3m_diff_gr_series(ts_model, val_index)
 
         # WeightedLagBlend & OLS only where complete lags exist
         wlf    = feat[["y", "lag_3", "lag_6", "lag_12"]].dropna()
@@ -306,17 +316,17 @@ try:
             preds["OLS"] = pd.Series(predict_ols_logspace(Xva, beta), index=wlf_va.index, dtype=float)
             ols_beta = beta
 
-        # New models (validation)
-        preds["ARIMA"]       = arima_val_series(ts, val_index)
-        preds["HoltWinters"] = holtwinters_val_series(ts, val_index)
-        preds["MA_GrowthAdj"]= magr_val_series(ts, val_index)
+        # New models (validation) on filled series
+        preds["ARIMA"]       = arima_val_series(ts_model, val_index)
+        preds["HoltWinters"] = holtwinters_val_series(ts_model, val_index)
+        preds["MA_GrowthAdj"]= magr_val_series(ts_model, val_index)
 
         # -------------------- Evaluate (SMAPE) --------------------
         smapes = {}
         for m, pser in preds.items():
             if not isinstance(pser, pd.Series):
                 pser = pd.Series(pser, index=val_index, dtype=float)
-            y_true = ts.reindex(pser.index).astype(float)
+            y_true = ts_model.reindex(pser.index).astype(float)  # eval against filled ground truth
             idx = y_true.index[y_true.notna() & pser.notna()]
             if len(idx) > 0:
                 yv = y_true.loc[idx].to_numpy(dtype=float)
@@ -341,12 +351,12 @@ try:
         logger.info(f"· {cid:<25} Best = {best_model:<20} (SMAPE: {smapes[best_model]:.2f})")
 
         # ===== Recursive 15-month forecast with the winner =====
-        hist = deque(ts.dropna().tolist(), maxlen=120)
+        hist = deque(ts_model.dropna().tolist(), maxlen=120)
         if not hist:
             logger.info(f"· Skipping {cid:<25} – No history after dropna().")
             continue
 
-        last_date = ts.index.max()
+        last_date = ts_model.index.max()
         future_idx = pd.date_range(last_date, periods=FORECAST_HORIZON + 1, freq="MS")[1:]
         fx_tag = f"{FX_ID_PREFIX[best_model]}_{STAMP:%Y%m%d}"
         load_ts_str = STAMP.strftime("%Y-%m-%d %H:%M:%S")
@@ -364,8 +374,9 @@ try:
 
         if best_model == "ARIMA":
             try:
-                mod = ARIMA(ts.dropna(), order=(1,1,0), seasonal_order=(1,0,0,12))
-                res = mod.fit()
+                mod = ARIMA(ts_model.dropna(), order=(1,1,0), seasonal_order=(1,0,0,12),
+                            enforce_stationarity=False, enforce_invertibility=False)
+                res = mod.fit(method_kwargs={"warn_convergence": False})
                 fc = res.forecast(FORECAST_HORIZON)
                 for d, p in zip(future_idx, fc):
                     append_row(d, p)
@@ -375,8 +386,8 @@ try:
 
         elif best_model == "HoltWinters":
             try:
-                mod = ExponentialSmoothing(ts.dropna(), trend="add", seasonal="add", seasonal_periods=12)
-                res = mod.fit()
+                mod = ExponentialSmoothing(ts_model.dropna(), trend="add", seasonal="add", seasonal_periods=12)
+                res = mod.fit(optimized=True, use_brute=False)
                 fc = res.forecast(FORECAST_HORIZON)
                 for d, p in zip(future_idx, fc):
                     append_row(d, p)
@@ -385,7 +396,7 @@ try:
                 continue
 
         elif best_model == "MA_GrowthAdj":
-            h = list(ts.dropna())
+            h = list(ts_model.dropna())
             for d in future_idx:
                 if len(h) < 6:
                     pred = h[-1]
@@ -398,7 +409,7 @@ try:
                 append_row(d, pred)
 
         else:
-            # Original recursive logic for the other five models
+            # Original recursive logic for the other five models on filled history
             for d in future_idx:
                 n = len(hist)
                 if best_model == "SeasonalNaive":
@@ -445,7 +456,7 @@ try:
                     pred = float(predict_ols_logspace(Xn, ols_beta)[0])
 
                 else:
-                    # Fallback: carry-forward last value
+                    # Fallback: carry forward last value
                     pred = float(hist[-1])
 
                 hist.append(pred)
@@ -473,6 +484,7 @@ try:
     if not ok:
         raise Exception("Failed to append forecast data to BigQuery.")
 
+    # Inactivate older overlapping rows (keep only the latest load_ts as 'forecast')
     logger.info("Inactivating older overlapping forecasts in destination table…")
     dedup_sql = f"""
     UPDATE `{DEST_TABLE}` AS t
@@ -488,10 +500,12 @@ try:
     bigquery_manager.run_gbq_sql(dedup_sql, return_dataframe=False)
     logger.info("✓ Older forecast rows marked as inactive.")
 
+    # Save local CSVs (forecasts + audit metrics)
     fx_df.to_csv(LOCAL_CSV, index=False)
     pd.DataFrame(audit_rows).to_csv(AUDIT_CSV, index=False)
     logger.info(f"✓ Local CSVs saved:\n    - {LOCAL_CSV}\n    - {AUDIT_CSV}")
 
+    # Log success to GBQ audit table (per your helper)
     bigquery_manager.update_log_in_bigquery()
     logger.info("✓ Workload forecasting script (Rpt 288) completed successfully.")
 
