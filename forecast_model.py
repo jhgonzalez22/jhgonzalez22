@@ -433,3 +433,15 @@ try:
 
 except Exception as exc:
     email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
+
+
+(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_288_File.py
+Traceback (most recent call last):
+  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 435, in <module>
+    email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
+  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1170, in handle_error
+    raise exception
+  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 291, in <module>
+    smapes[m] = smape(y_val_full[mask], p[mask])
+                      ~~~~~~~~~~^^^^^^
+IndexError: only integers, slices (`:`), ellipsis (`...`), numpy.newaxis (`None`) and integer or boolean arrays are valid indices
