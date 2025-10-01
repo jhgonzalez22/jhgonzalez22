@@ -521,3 +521,18 @@ try:
 except Exception as exc:
     # On any unhandled error, log it and send a notification email
     email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
+
+(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_288_File.py
+Traceback (most recent call last):
+  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 523, in <module>
+    email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
+  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1170, in handle_error
+    raise exception
+  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 253, in <module>
+    fred_full = extend_fred_for_horizon(fred_src, FORECAST_HORIZON)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 164, in extend_fred_for_horizon
+    first = fred_df.index.min().to_period("M").to_timestamp("MS")
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "period.pyx", line 1996, in pandas._libs.tslibs.period._Period.to_timestamp
+AttributeError: 'pandas._libs.tslibs.offsets.MonthBegin' object has no attribute '_period_dtype_code'
