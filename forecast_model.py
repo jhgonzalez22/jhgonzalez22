@@ -5,14 +5,12 @@ CX Platforms – Workload Drivers Forecast (TotalOrders)
 Pipeline (PC/GBQ):
   1) Pull monthly client time series (TotalOrders only) from BigQuery.
   2) Build features limited to lags 3/6/12 (to avoid overfitting).
-  3) Benchmark 8 models on the last 6 months using SMAPE:
+  3) Benchmark 6 models on the last 6 months using SMAPE:
       - SeasonalNaive
       - SeasonalNaiveGR
       - SeasonalNaive3mDiffGR
       - WeightedLagBlend
       - OLS (log-space)
-      - ARIMA (SARIMA-lite)
-      - HoltWinters (Exponential Smoothing)
       - MA_GrowthAdj (volatility-aware: MA3 baseline + growth ratio)
      * Seasonal models attempt when windows exist.
      * Lag models evaluate only if lag rows exist (no hard InsufficientHistory stop).
@@ -32,10 +30,6 @@ import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore")
-
-# statsmodels for ARIMA + Holt-Winters
-from statsmodels.tsa.arima.model import ARIMA
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
 # ------------------- helper-package path --------------------
 sys.path.append(r'C:\WFM_Scripting\Automation')
@@ -78,8 +72,6 @@ FX_ID_PREFIX = {
     "SeasonalNaive3mDiffGR":   "snaive_diffgr_workload",
     "WeightedLagBlend":        "wblend_workload",
     "OLS":                     "ols_workload",
-    "ARIMA":                   "arima_workload",
-    "HoltWinters":             "holt_workload",
     "MA_GrowthAdj":            "magr_workload",
 }
 
@@ -188,32 +180,7 @@ def predict_ols_logspace(X: np.ndarray, beta: np.ndarray) -> np.ndarray:
     z = np.clip(z, -20.0, 20.0)
     return np.expm1(z)
 
-# ------------------- NEW MODELS (validation) ----------------
-def arima_val_series(ts: pd.Series, val_index: pd.DatetimeIndex) -> pd.Series:
-    """ARIMA(1,1,0) + seasonal AR(1) @ 12 — validation predictions."""
-    try:
-        y = ts.dropna()
-        if len(y) < 18:
-            return pd.Series([np.nan]*len(val_index), index=val_index, dtype=float)
-        mod = ARIMA(y, order=(1,1,0), seasonal_order=(1,0,0,12),
-                    enforce_stationarity=False, enforce_invertibility=False)
-        res = mod.fit(method_kwargs={"warn_convergence": False})
-        return pd.Series(res.predict(start=val_index[0], end=val_index[-1]), index=val_index, dtype=float)
-    except Exception:
-        return pd.Series([np.nan]*len(val_index), index=val_index, dtype=float)
-
-def holtwinters_val_series(ts: pd.Series, val_index: pd.DatetimeIndex) -> pd.Series:
-    """Holt-Winters additive trend + additive seasonality (12)."""
-    try:
-        y = ts.dropna()
-        if len(y) < 24:
-            return pd.Series([np.nan]*len(val_index), index=val_index, dtype=float)
-        mod = ExponentialSmoothing(y, trend="add", seasonal="add", seasonal_periods=12)
-        res = mod.fit(optimized=True, use_brute=False)
-        return pd.Series(res.forecast(len(val_index)), index=val_index, dtype=float)
-    except Exception:
-        return pd.Series([np.nan]*len(val_index), index=val_index, dtype=float)
-
+# ------------------- MA_GrowthAdj (validation) --------------
 def magr_val_series(ts: pd.Series, val_index: pd.DatetimeIndex) -> pd.Series:
     """Volatility-aware smoothing: MA3 baseline * (1 + recent 3m growth)."""
     out = []
@@ -251,8 +218,7 @@ try:
         ts = g.set_index("date")["target_volume"].asfreq("MS").sort_index()
 
         # Robust fill for modeling (keeps structure; helps lags/seasonality)
-        ts_model = ts.copy()
-        ts_model = ts_model.ffill().bfill()
+        ts_model = ts.copy().ffill().bfill()
 
         # Build lag frame on filled series
         feat = add_lags(ts_model)
@@ -316,10 +282,8 @@ try:
             preds["OLS"] = pd.Series(predict_ols_logspace(Xva, beta), index=wlf_va.index, dtype=float)
             ols_beta = beta
 
-        # New models (validation) on filled series
-        preds["ARIMA"]       = arima_val_series(ts_model, val_index)
-        preds["HoltWinters"] = holtwinters_val_series(ts_model, val_index)
-        preds["MA_GrowthAdj"]= magr_val_series(ts_model, val_index)
+        # MA_GrowthAdj (validation) on filled series
+        preds["MA_GrowthAdj"] = magr_val_series(ts_model, val_index)
 
         # -------------------- Evaluate (SMAPE) --------------------
         smapes = {}
@@ -346,7 +310,7 @@ try:
 
         # Selection with tie-break priority
         priority = ["SeasonalNaive3mDiffGR", "SeasonalNaiveGR", "SeasonalNaive",
-                    "WeightedLagBlend", "OLS", "ARIMA", "HoltWinters", "MA_GrowthAdj"]
+                    "WeightedLagBlend", "OLS", "MA_GrowthAdj"]
         best_model = min(smapes, key=lambda k: (smapes[k], priority.index(k) if k in priority else 999))
         logger.info(f"· {cid:<25} Best = {best_model:<20} (SMAPE: {smapes[best_model]:.2f})")
 
@@ -368,34 +332,12 @@ try:
                 "client_id": cid,
                 "fx_vol":    int(round(value)),
                 "fx_id":     fx_tag,
-                "fx_status": "A",
+                "fx_status": "forecast",
                 "load_ts":   load_ts_str
             })
 
-        if best_model == "ARIMA":
-            try:
-                mod = ARIMA(ts_model.dropna(), order=(1,1,0), seasonal_order=(1,0,0,12),
-                            enforce_stationarity=False, enforce_invertibility=False)
-                res = mod.fit(method_kwargs={"warn_convergence": False})
-                fc = res.forecast(FORECAST_HORIZON)
-                for d, p in zip(future_idx, fc):
-                    append_row(d, p)
-            except Exception as _:
-                logger.info(f"· {cid} – ARIMA forecast failed; skipping client.")
-                continue
-
-        elif best_model == "HoltWinters":
-            try:
-                mod = ExponentialSmoothing(ts_model.dropna(), trend="add", seasonal="add", seasonal_periods=12)
-                res = mod.fit(optimized=True, use_brute=False)
-                fc = res.forecast(FORECAST_HORIZON)
-                for d, p in zip(future_idx, fc):
-                    append_row(d, p)
-            except Exception as _:
-                logger.info(f"· {cid} – HoltWinters forecast failed; skipping client.")
-                continue
-
-        elif best_model == "MA_GrowthAdj":
+        # Recursive generation
+        if best_model == "MA_GrowthAdj":
             h = list(ts_model.dropna())
             for d in future_idx:
                 if len(h) < 6:
@@ -409,55 +351,55 @@ try:
                 append_row(d, pred)
 
         else:
-            # Original recursive logic for the other five models on filled history
             for d in future_idx:
                 n = len(hist)
+                L = list(hist)  # convert deque to list for safe slicing
+
                 if best_model == "SeasonalNaive":
-                    base = hist[-12] if n >= 12 else hist[-1]
+                    base = L[-12] if n >= 12 else L[-1]
                     pred = float(base)
 
                 elif best_model == "SeasonalNaiveGR":
-                    base = hist[-12] if n >= 12 else hist[-1]
+                    base = L[-12] if n >= 12 else L[-1]
                     if n >= 6:
-                        cur3 = np.mean(hist[-3:])
-                        prev3 = np.mean(hist[-6:-3])
+                        cur3  = float(np.mean(L[-3:]))
+                        prev3 = float(np.mean(L[-6:-3]))
                         r = (cur3/prev3 - 1.0) if prev3 > 0 else 0.0
                     else:
                         r = 0.0
                     pred = float(base) * (1.0 + r)
 
                 elif best_model == "SeasonalNaive3mDiffGR":
-                    base = hist[-12] if n >= 12 else hist[-1]
+                    base = L[-12] if n >= 12 else L[-1]
                     if n >= 6:
-                        cur3 = np.mean(hist[-3:])
-                        prev3 = np.mean(hist[-6:-3])
+                        cur3  = float(np.mean(L[-3:]))
+                        prev3 = float(np.mean(L[-6:-3]))
                         r = (cur3/prev3 - 1.0) if prev3 > 0 else 0.0
                     else:
                         r = 0.0
                     if n >= 18:
-                        win_py = np.mean(hist[-15:-12])
-                        prev_py = np.mean(hist[-18:-15])
+                        win_py  = float(np.mean(L[-15:-12]))
+                        prev_py = float(np.mean(L[-18:-15]))
                         rpy = (win_py/prev_py - 1.0) if prev_py > 0 else 0.0
                     else:
                         rpy = 0.0
                     pred = float(base) * (1.0 + (r - rpy))
 
                 elif best_model == "WeightedLagBlend" and wblend_weights is not None:
-                    x3  = hist[-3]  if n >= 3  else hist[-1]
-                    x6  = hist[-6]  if n >= 6  else hist[-1]
-                    x12 = hist[-12] if n >= 12 else hist[-1]
+                    x3  = L[-3]  if n >= 3  else L[-1]
+                    x6  = L[-6]  if n >= 6  else L[-1]
+                    x12 = L[-12] if n >= 12 else L[-1]
                     pred = wblend_weights["w3"]*x3 + wblend_weights["w6"]*x6 + wblend_weights["w12"]*x12
 
                 elif best_model == "OLS" and ols_beta is not None:
-                    x3  = hist[-3]  if n >= 3  else hist[-1]
-                    x6  = hist[-6]  if n >= 6  else hist[-1]
-                    x12 = hist[-12] if n >= 12 else hist[-1]
+                    x3  = L[-3]  if n >= 3  else L[-1]
+                    x6  = L[-6]  if n >= 6  else L[-1]
+                    x12 = L[-12] if n >= 12 else L[-1]
                     Xn  = np.array([[1.0, x3, x6, x12]], dtype=np.float64)
                     pred = float(predict_ols_logspace(Xn, ols_beta)[0])
 
                 else:
-                    # Fallback: carry forward last value
-                    pred = float(hist[-1])
+                    pred = float(L[-1])
 
                 hist.append(pred)
                 append_row(d, pred)
@@ -512,15 +454,3 @@ try:
 except Exception as exc:
     # On any unhandled error, log it and send a notification email
     email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
-
-
-(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_288_File.py
-Traceback (most recent call last):
-  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 514, in <module>
-    email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
-  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1170, in handle_error
-    raise exception
-  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 432, in <module>
-    cur3 = np.mean(hist[-3:])
-                   ~~~~^^^^^
-TypeError: sequence index must be integer, not 'slice'
