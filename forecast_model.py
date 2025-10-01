@@ -6,7 +6,7 @@ Pipeline (PC/GBQ):
   1) Pull monthly client time series (TotalOrders only) and FRED economic data from BigQuery.
   2) Engineer features (lags restricted to 3/6/12, rolling(3), seasonal sin/cos + month dummies, FRED).
   3) Train & evaluate candidate models on the last 3 months (validation) using SMAPE.
-  4) Select the best model per client and produce a 15-month recursive forecast (uses future FRED via simple extension).
+  4) Select the best model per client and produce a 15-month recursive forecast (uses future FRED via forward fill).
   5) Append forecasts to GBQ table, inactivate older duplicates, save local CSVs, and log success.
 
 Candidate models:
@@ -33,7 +33,6 @@ from collections import deque
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import Ridge, Lasso
-from sklearn.metrics import mean_squared_error
 from xgboost import XGBRegressor
 
 warnings.filterwarnings("ignore")  # Keep logs tidy
@@ -154,26 +153,31 @@ def build_supervised_frame(ts: pd.Series, econ_df: pd.DataFrame) -> pd.DataFrame
 
 def extend_fred_for_horizon(fred_df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     """
-    Extend FRED monthly data through the forecast horizon with a simple expanding mean
-    (placeholder; replace with a stronger projection if available).
+    Forward-fill future months with the last known FRED values.
+    Assumes monthly data; returns a Date-indexed DataFrame covering history + horizon.
     """
     fred_df = fred_df.copy()
     fred_df["date"] = pd.to_datetime(fred_df["date"])
     fred_df = fred_df.sort_values("date").set_index("date")
 
-    last_known = fred_df.index.max()
-    future_dates = pd.date_range(start=last_known + pd.DateOffset(months=1),
-                                 periods=horizon, freq="MS")
+    # Ensure monthly MS index across historical span
+    first = fred_df.index.min().to_period("M").to_timestamp("MS")
+    last  = fred_df.index.max().to_period("M").to_timestamp("MS")
+    full_hist_index = pd.date_range(first, last, freq="MS")
+    fred_df = fred_df.reindex(full_hist_index)
 
-    rows = []
-    for i, d in enumerate(future_dates, start=1):
-        # expanding mean of all available history (simple, conservative)
-        window = fred_df.iloc[:].mean()
-        rows.append(window)
+    # Forward-fill history; backfill leading if necessary
+    fred_df = fred_df.ffill().bfill()
 
-    future_ext = pd.DataFrame(rows, index=future_dates, columns=fred_df.columns)
-    full = pd.concat([fred_df, future_ext])
-    return full
+    # Build future index and repeat the last known row for each future month
+    future_index = pd.date_range(last + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
+    if len(future_index):
+        last_row = fred_df.iloc[[-1]].copy()
+        future_ext = pd.concat([last_row] * len(future_index), ignore_index=True)
+        future_ext.index = future_index
+        fred_df = pd.concat([fred_df, future_ext], axis=0)
+
+    return fred_df
 
 # ------------------- seasonal naive with growth ------------
 def seasonal_naive_3mgr_val(ts: pd.Series, val_index: pd.DatetimeIndex) -> np.ndarray:
@@ -245,12 +249,10 @@ try:
     wd_df["date"] = pd.to_datetime(wd_df["date"])
     fred_src["date"] = pd.to_datetime(fred_src["date"])
 
-    # Extend FRED out through the forecast horizon (simple expanding mean)
+    # Extend FRED out through the forecast horizon (pure forward fill)
     fred_full = extend_fred_for_horizon(fred_src, FORECAST_HORIZON)
-    logger.info(f"✓ FRED extended through {fred_full.index.max().date()}.")
-
-    # Keep only columns we actually use as exogenous features
-    fred_full = fred_full[["UNRATE", "HSN1F", "FEDFUNDS", "MORTGAGE30US"]]
+    fred_full = fred_full[["UNRATE", "HSN1F", "FEDFUNDS", "MORTGAGE30US"]].ffill().bfill()
+    logger.info(f"✓ FRED forward-filled through {fred_full.index.max().date()}.")
 
     # 2) Iterate by client: features, models, validation ----------------------
     forecasts, audit_rows = [], []
@@ -261,10 +263,9 @@ try:
     for cid, g in wd_df.groupby("client_id", sort=False):
         client = g[["date", "target_volume"]].copy()
         client = client.set_index("date").sort_index()
-        # Force to month-start frequency; if gaps, we'll leave NaN (we drop later in features)
-        client = client.asfreq("MS")
+        client = client.asfreq("MS")  # month start
 
-        # Minimal history check (allow models to run realistically)
+        # Minimal history check
         if client["target_volume"].dropna().shape[0] < 18:
             logger.info(f"· Skipping {cid:<25} – Insufficient history ({client.shape[0]} rows).")
             continue
@@ -319,7 +320,6 @@ try:
         preds["SeasonalNaive3mGR"] = seasonal_naive_3mgr_val(ts, val_index)
 
         # --- E) WeightedLagBlend (3/6/12) ---
-        # Build a compact frame aligned to feat index for the same val window
         wlf = pd.DataFrame({
             "y":    feat["y"],
             "lag3": feat["lag_3"],
@@ -337,6 +337,7 @@ try:
             l6  = wlf_tr["lag6"].values
             l12 = wlf_tr["lag12"].values
 
+            # Tune on training set (SMAPE)
             for w3, w6, w12 in weight_grid_3_6_12(GRID_STEP, MIN_SEASONAL_W):
                 yhat = w3*l3 + w6*l6 + w12*l12
                 s = smape(ytr, yhat)
@@ -393,14 +394,14 @@ try:
         lin_cols = models[best_model][1] if best_model in ("Ridge", "Lasso") else None
         mdl_obj  = models.get(best_model)
 
-        # We need econ values by date for forecast months
-        econ_full = fred_full  # already extended through horizon
+        # Econ values for forecast months (already forward-filled)
+        econ_full = fred_full
 
         for d in future_idx:
             # Build a feature row consistent with training schema
             if best_model == "XGBoost":
                 row = {}
-                # lags from history (fallback to last known if not enough depth)
+                # lags from history (fallbacks)
                 row["lag_3"]  = hist[-3]  if len(hist) >= 3  else hist[-1]
                 row["lag_6"]  = hist[-6]  if len(hist) >= 6  else hist[-1]
                 row["lag_12"] = hist[-12] if len(hist) >= 12 else hist[-1]
@@ -411,14 +412,16 @@ try:
                 row["sin_month"] = np.sin(2*np.pi*m/12.0)
                 row["cos_month"] = np.cos(2*np.pi*m/12.0)
                 for mo in range(1, 13):
-                    row[f"mo_{mo}"] = 1.0 if mo == mo else 0.0  # (all zeros; XGB won’t depend on dummies if gain=0)
-                # Econ features (use extended FRED; fallback to last known row)
+                    row[f"mo_{mo}"] = 1.0 if mo == m else 0.0
+                # Econ features (forward-filled)
                 econ = econ_full.loc[d] if d in econ_full.index else econ_full.iloc[-1]
                 for fred_col in ["UNRATE", "HSN1F", "FEDFUNDS", "MORTGAGE30US"]:
-                    if fred_col in xgb_cols:
+                    if xgb_cols and fred_col in xgb_cols:
                         row[fred_col] = float(econ.get(fred_col, np.nan))
                 # order columns exactly as training
-                Xn = np.array([[row[c] for c in xgb_cols]], dtype=float)
+                Xn = np.array([[row.get(c, 0.0) for c in xgb_cols]], dtype=float)
+                if np.isnan(Xn).any():
+                    Xn = np.nan_to_num(Xn, nan=0.0)
                 pred = float(mdl_obj.predict(Xn)[0])
 
             elif best_model in ("Ridge", "Lasso"):
@@ -434,12 +437,17 @@ try:
                 row["sin_month"] = np.sin(2*np.pi*m/12.0)
                 row["cos_month"] = np.cos(2*np.pi*m/12.0)
                 for mo in range(1, 13):
-                    row[f"mo_{mo}"] = 1.0 if mo == mo else 0.0
+                    row[f"mo_{mo}"] = 1.0 if mo == m else 0.0
                 econ = econ_full.loc[d] if d in econ_full.index else econ_full.iloc[-1]
                 for fred_col in ["UNRATE", "HSN1F", "FEDFUNDS", "MORTGAGE30US"]:
                     if fred_col in cols:
                         row[fred_col] = float(econ.get(fred_col, np.nan))
-                Xn = np.array([[row[c] for c in cols]], dtype=float)
+
+                # Ensure every expected column exists; build matrix in order
+                Xn = np.array([[row.get(c, 0.0) for c in cols]], dtype=float)
+                if np.isnan(Xn).any():
+                    Xn = np.nan_to_num(Xn, nan=0.0)
+
                 pred = safe_expm1(model.predict(Xn)[0])
 
             elif best_model == "WeightedLagBlend":
@@ -462,7 +470,7 @@ try:
                 "fx_vol":    int(round(pred)),
                 "fx_id":     fx_tag,                  # underscore format
                 "fx_status": "forecast",              # latest rows marked as "forecast"
-                "load_ts":   STAMP.strftime("%Y-%m-%d %H:%M:%S")
+                "load_ts":   load_ts_str
             })
 
         # Also record the winning model headline metric row into audit
@@ -513,30 +521,3 @@ try:
 except Exception as exc:
     # On any unhandled error, log it and send a notification email
     email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
-
-(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_288_File.py
-Traceback (most recent call last):
-  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 515, in <module>
-    email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
-  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1170, in handle_error
-    raise exception
-  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 443, in <module>
-    pred = safe_expm1(model.predict(Xn)[0])
-                      ^^^^^^^^^^^^^^^^^
-  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\sklearn\linear_model\_base.py", line 386, in predict
-    return self._decision_function(X)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\sklearn\linear_model\_base.py", line 369, in _decision_function
-    X = self._validate_data(X, accept_sparse=["csr", "csc", "coo"], reset=False)
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\sklearn\base.py", line 605, in _validate_data
-    out = check_array(X, input_name="X", **check_params)
-          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\sklearn\utils\validation.py", line 957, in check_array
-    _assert_all_finite(
-  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\sklearn\utils\validation.py", line 122, in _assert_all_finite
-    _assert_all_finite_element_wise(
-  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\sklearn\utils\validation.py", line 171, in _assert_all_finite_element_wise
-    raise ValueError(msg_err)
-ValueError: Input X contains NaN.
-Ridge does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
