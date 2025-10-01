@@ -433,3 +433,15 @@ try:
 
 except Exception as exc:
     email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
+
+(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_288_File.py
+Traceback (most recent call last):
+  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 435, in <module>
+    email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
+  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1170, in handle_error
+    raise exception
+  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 382, in <module>
+    "fx_date":   d.strftime("%Y-%m-%01"),
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+  File "timestamps.pyx", line 1518, in pandas._libs.tslibs.timestamps.Timestamp.strftime
+ValueError: Invalid format string
