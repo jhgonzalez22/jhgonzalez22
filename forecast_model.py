@@ -513,3 +513,30 @@ try:
 except Exception as exc:
     # On any unhandled error, log it and send a notification email
     email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
+
+(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_288_File.py
+Traceback (most recent call last):
+  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 515, in <module>
+    email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
+  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1170, in handle_error
+    raise exception
+  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 443, in <module>
+    pred = safe_expm1(model.predict(Xn)[0])
+                      ^^^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\sklearn\linear_model\_base.py", line 386, in predict
+    return self._decision_function(X)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\sklearn\linear_model\_base.py", line 369, in _decision_function
+    X = self._validate_data(X, accept_sparse=["csr", "csc", "coo"], reset=False)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\sklearn\base.py", line 605, in _validate_data
+    out = check_array(X, input_name="X", **check_params)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\sklearn\utils\validation.py", line 957, in check_array
+    _assert_all_finite(
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\sklearn\utils\validation.py", line 122, in _assert_all_finite
+    _assert_all_finite_element_wise(
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\sklearn\utils\validation.py", line 171, in _assert_all_finite_element_wise
+    raise ValueError(msg_err)
+ValueError: Input X contains NaN.
+Ridge does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
