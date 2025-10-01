@@ -423,3 +423,21 @@ try:
 
 except Exception as exc:
     email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
+
+(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_288_File.py
+AttributeError: 'int' object has no attribute 'log1p'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 425, in <module>
+    email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
+  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1170, in handle_error
+    raise exception
+  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 262, in <module>
+    beta = fit_ols_logspace(Xtr, ytr)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 176, in fit_ols_logspace
+    y_log = np.log1p(np.clip(y, 0, None))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: loop of ufunc does not support argument 0 of type int which has no callable log1p method
