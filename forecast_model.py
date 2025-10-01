@@ -172,14 +172,24 @@ def fit_ols_logspace(X: np.ndarray, y: np.ndarray):
     """
     Solve beta for log1p(y) = X @ beta in least squares sense.
     X must include intercept column.
+    Coerces inputs to float and sanitizes non-finite values.
     """
-    y_log = np.log1p(np.clip(y, 0, None))
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+
+    # Replace non-finite with 0, clip negatives to 0 before log1p
+    y = np.where(np.isfinite(y), y, 0.0)
+    y = np.clip(y, 0.0, None)
+
+    y_log = np.log1p(y)
     beta, *_ = np.linalg.lstsq(X, y_log, rcond=None)
     return beta
 
 def predict_ols_logspace(X: np.ndarray, beta: np.ndarray) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float64)
+    beta = np.asarray(beta, dtype=np.float64)
     z = X @ beta
-    z = np.clip(z, -20.0, 20.0)
+    z = np.clip(z, -20.0, 20.0)  # numerical safety
     return np.expm1(z)
 
 # ------------------- MAIN -----------------------------------
@@ -257,8 +267,8 @@ try:
                 ols_tr["lag_3"].values,
                 ols_tr["lag_6"].values,
                 ols_tr["lag_12"].values,
-            ])
-            ytr = ols_tr["y"].values
+            ]).astype(np.float64)
+            ytr = ols_tr["y"].values.astype(np.float64)
             beta = fit_ols_logspace(Xtr, ytr)
 
             Xva = np.column_stack([
@@ -266,7 +276,7 @@ try:
                 ols_va["lag_3"].values,
                 ols_va["lag_6"].values,
                 ols_va["lag_12"].values,
-            ])
+            ]).astype(np.float64)
             preds["OLS"] = predict_ols_logspace(Xva, beta)
             ols_beta = beta
         else:
@@ -358,7 +368,7 @@ try:
                 x3  = hist[-3]  if n >= 3  else hist[-1]
                 x6  = hist[-6]  if n >= 6  else hist[-1]
                 x12 = hist[-12] if n >= 12 else hist[-1]
-                Xn  = np.array([[1.0, x3, x6, x12]], dtype=float)
+                Xn  = np.array([[1.0, x3, x6, x12]], dtype=np.float64)
                 pred = float(predict_ols_logspace(Xn, ols_beta)[0])
 
             else:
@@ -423,21 +433,3 @@ try:
 
 except Exception as exc:
     email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
-
-(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_288_File.py
-AttributeError: 'int' object has no attribute 'log1p'
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 425, in <module>
-    email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
-  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1170, in handle_error
-    raise exception
-  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 262, in <module>
-    beta = fit_ols_logspace(Xtr, ytr)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 176, in fit_ols_logspace
-    y_log = np.log1p(np.clip(y, 0, None))
-            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-TypeError: loop of ufunc does not support argument 0 of type int which has no callable log1p method
