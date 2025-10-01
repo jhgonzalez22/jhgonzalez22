@@ -54,7 +54,7 @@ SELECT
   client_id,
   TotalOrders  AS target_volume
 FROM `tax_clnt_svcs.view_cx_nontax_platforms_workload_drivers`
-WHERE MonthOfOrder < DATE_TRUNC(CURRENT_DATE(), MONTH)
+WHERE MonthOfOrder < '2025-01-01'
 """
 DEST_TABLE = "tax_clnt_svcs.cx_nontax_platforms_workload_drivers_fx"
 
@@ -368,7 +368,7 @@ try:
                 "client_id": cid,
                 "fx_vol":    int(round(value)),
                 "fx_id":     fx_tag,
-                "fx_status": "forecast",
+                "fx_status": "A",
                 "load_ts":   load_ts_str
             })
 
@@ -512,3 +512,15 @@ try:
 except Exception as exc:
     # On any unhandled error, log it and send a notification email
     email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
+
+
+(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_288_File.py
+Traceback (most recent call last):
+  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 514, in <module>
+    email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
+  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1170, in handle_error
+    raise exception
+  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 432, in <module>
+    cur3 = np.mean(hist[-3:])
+                   ~~~~^^^^^
+TypeError: sequence index must be integer, not 'slice'
