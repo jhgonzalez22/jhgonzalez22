@@ -5,12 +5,15 @@ CX Platforms – Workload Drivers Forecast (TotalOrders)
 Pipeline (PC/GBQ):
   1) Pull monthly client time series (TotalOrders only) from BigQuery.
   2) Build features limited to lags 3/6/12 (to avoid overfitting).
-  3) Benchmark 5 models on the last 6 months using SMAPE:
-      - SeasonalNaive                -> y[t-12]
-      - SeasonalNaiveGR              -> y[t-12] * (1 + recent 3-month growth)
-      - SeasonalNaive3mDiffGR        -> y[t-12] * (1 + (recent 3m growth - prior-year same-window 3m growth))
-      - WeightedLagBlend (dynamic)   -> w3*lag3 + w6*lag6 + w12*lag12 (weights learned on TRAIN ONLY)
-      - OLS (log-space)              -> log1p(y) ~ [1, lag3, lag6, lag12] (closed-form)
+  3) Benchmark 8 models on the last 6 months using SMAPE:
+      - SeasonalNaive
+      - SeasonalNaiveGR
+      - SeasonalNaive3mDiffGR
+      - WeightedLagBlend
+      - OLS (log-space)
+      - ARIMA (SARIMA-lite)
+      - HoltWinters (Exponential Smoothing)
+      - MA_GrowthAdj (volatility-aware: MA3 baseline + growth ratio)
      * Seasonal models attempt when windows exist.
      * Lag models evaluate only if lag rows exist (no hard InsufficientHistory stop).
   4) Select best model per client (lowest SMAPE).
@@ -29,6 +32,10 @@ import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore")
+
+# statsmodels for ARIMA + Holt-Winters
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
 # ------------------- helper-package path --------------------
 sys.path.append(r'C:\WFM_Scripting\Automation')
@@ -59,7 +66,7 @@ AUDIT_CSV = r"C:\WFM_Scripting\cx_nontax_workload_drivers_fx_model_eval.csv"
 FORECAST_HORIZON = 15      # months ahead
 TEST_LEN         = 6       # last 6 months for validation
 LAGS             = (3, 6, 12)
-GRID_STEP        = 0.05    # for WeightedLagBlend search
+GRID_STEP        = 0.05    # WeightedLagBlend search
 MIN_W12          = 0.0     # allow zero; set >0.0 to enforce seasonality minimum
 
 STAMP_TZ = pytz.timezone("America/Chicago")
@@ -71,6 +78,9 @@ FX_ID_PREFIX = {
     "SeasonalNaive3mDiffGR":   "snaive_diffgr_workload",
     "WeightedLagBlend":        "wblend_workload",
     "OLS":                     "ols_workload",
+    "ARIMA":                   "arima_workload",
+    "HoltWinters":             "holt_workload",
+    "MA_GrowthAdj":            "magr_workload",
 }
 
 # ------------------- metrics -------------------------------
@@ -100,10 +110,7 @@ def add_lags(ts: pd.Series) -> pd.DataFrame:
     return df
 
 def recent_3m_growth(ts: pd.Series, pos: int) -> float:
-    """
-    r_recent(t) = mean(y[t-3:t]) / mean(y[t-6:t-3]) - 1
-    pos is position index in ts (iloc).
-    """
+    """r_recent(t) = mean(y[t-3:t]) / mean(y[t-6:t-3]) - 1"""
     if pos < 6:
         return 0.0
     cur3  = ts.iloc[pos-3:pos].values.astype(float)
@@ -112,9 +119,7 @@ def recent_3m_growth(ts: pd.Series, pos: int) -> float:
     return (float(np.mean(cur3)) / prev_mean - 1.0) if prev_mean > 0 else 0.0
 
 def prior_year_3m_growth(ts: pd.Series, pos: int) -> float:
-    """
-    r_py(t) = mean(y[t-15:t-12]) / mean(y[t-18:t-15]) - 1
-    """
+    """r_py(t) = mean(y[t-15:t-12]) / mean(y[t-18:t-15]) - 1"""
     if pos < 18:
         return 0.0
     win_py  = ts.iloc[pos-15:pos-12].values.astype(float)
@@ -122,8 +127,8 @@ def prior_year_3m_growth(ts: pd.Series, pos: int) -> float:
     prev_mean = float(np.mean(prev_py))
     return (float(np.mean(win_py)) / prev_mean - 1.0) if prev_mean > 0 else 0.0
 
+# ------------------- seasonal models (validation) -----------
 def seasonal_naive_series(ts: pd.Series, idx: pd.DatetimeIndex) -> pd.Series:
-    """Series yhat = y[t-12] on idx (NaN where unavailable)."""
     return ts.shift(12).reindex(idx)
 
 def seasonal_naive_gr_series(ts: pd.Series, idx: pd.DatetimeIndex) -> pd.Series:
@@ -153,6 +158,7 @@ def seasonal_naive_3m_diff_gr_series(ts: pd.Series, idx: pd.DatetimeIndex) -> pd
         out.append(max(0.0, float(base) * (1.0 + (r - rp))))
     return pd.Series(out, index=idx, dtype=float)
 
+# ------------------- Weighted Lag Blend ---------------------
 def weight_grid(step=GRID_STEP, min_w12=MIN_W12):
     vals = np.arange(0.0, 1.0 + 1e-9, step)
     for w3 in vals:
@@ -164,20 +170,13 @@ def weight_grid(step=GRID_STEP, min_w12=MIN_W12):
             if w12 + 1e-12 >= min_w12:
                 yield (float(w3), float(w6), float(w12))
 
-# ------------------- OLS closed-form (log-space) ------------
+# ------------------- OLS (log-space, closed form) -----------
 def fit_ols_logspace(X: np.ndarray, y: np.ndarray):
-    """
-    Solve beta for log1p(y) = X @ beta in least squares sense.
-    X must include intercept column.
-    Coerces inputs to float and sanitizes non-finite values.
-    """
+    """Solve β for log1p(y) = Xβ."""
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
-
-    # Replace non-finite with 0, clip negatives to 0 before log1p
     y = np.where(np.isfinite(y), y, 0.0)
     y = np.clip(y, 0.0, None)
-
     y_log = np.log1p(y)
     beta, *_ = np.linalg.lstsq(X, y_log, rcond=None)
     return beta
@@ -186,8 +185,46 @@ def predict_ols_logspace(X: np.ndarray, beta: np.ndarray) -> np.ndarray:
     X = np.asarray(X, dtype=np.float64)
     beta = np.asarray(beta, dtype=np.float64)
     z = X @ beta
-    z = np.clip(z, -20.0, 20.0)  # numerical safety
+    z = np.clip(z, -20.0, 20.0)
     return np.expm1(z)
+
+# ------------------- NEW MODELS (validation) ----------------
+def arima_val_series(ts: pd.Series, val_index: pd.DatetimeIndex) -> pd.Series:
+    """ARIMA(1,1,0) + seasonal AR(1) @ 12 — validation predictions."""
+    try:
+        mod = ARIMA(ts.dropna(), order=(1,1,0), seasonal_order=(1,0,0,12))
+        res = mod.fit()
+        # predict over validation index range
+        return pd.Series(res.predict(start=val_index[0], end=val_index[-1]), index=val_index, dtype=float)
+    except Exception:
+        return pd.Series([np.nan]*len(val_index), index=val_index, dtype=float)
+
+def holtwinters_val_series(ts: pd.Series, val_index: pd.DatetimeIndex) -> pd.Series:
+    """Holt-Winters additive trend + additive seasonality (12)."""
+    try:
+        mod = ExponentialSmoothing(ts.dropna(), trend="add", seasonal="add", seasonal_periods=12)
+        res = mod.fit()
+        return pd.Series(res.forecast(len(val_index)), index=val_index, dtype=float)
+    except Exception:
+        return pd.Series([np.nan]*len(val_index), index=val_index, dtype=float)
+
+def magr_val_series(ts: pd.Series, val_index: pd.DatetimeIndex) -> pd.Series:
+    """Volatility-aware smoothing: MA3 baseline * (1 + recent 3m growth)."""
+    out = []
+    for d in val_index:
+        # ensure position exists even if value is NaN
+        if d not in ts.index:
+            out.append(np.nan); continue
+        pos = ts.index.get_loc(d)
+        if isinstance(pos, slice):  # should not happen for unique index
+            pos = pos.start
+        if pos < 6:
+            out.append(np.nan); continue
+        ma3   = float(np.nanmean(ts.iloc[pos-3:pos].values))
+        prev3 = float(np.nanmean(ts.iloc[pos-6:pos-3].values))
+        r = (ma3/prev3 - 1.0) if prev3 > 0 else 0.0
+        out.append(max(0.0, ma3 * (1.0 + r)))
+    return pd.Series(out, index=val_index, dtype=float)
 
 # ------------------- MAIN -----------------------------------
 try:
@@ -218,35 +255,32 @@ try:
         val_index = feat.index[-TEST_LEN:]
         tr_index  = feat.index[:-TEST_LEN]
 
+        # -------------------- Predictions dict --------------------
         preds = {}
 
-        # ========== A) SeasonalNaive ==========
-        preds["SeasonalNaive"] = seasonal_naive_series(ts, val_index)
-
-        # ========== B) SeasonalNaiveGR ==========
-        preds["SeasonalNaiveGR"] = seasonal_naive_gr_series(ts, val_index)
-
-        # ========== C) SeasonalNaive3mDiffGR ==========
+        # Originals (validation)
+        preds["SeasonalNaive"]         = seasonal_naive_series(ts, val_index)
+        preds["SeasonalNaiveGR"]       = seasonal_naive_gr_series(ts, val_index)
         preds["SeasonalNaive3mDiffGR"] = seasonal_naive_3m_diff_gr_series(ts, val_index)
 
-        # ========== D) WeightedLagBlend (TRAIN-only tuning) ==========
-        wlf = feat[["y", "lag_3", "lag_6", "lag_12"]].dropna()
+        # WeightedLagBlend & OLS only where complete lags exist
+        wlf    = feat[["y", "lag_3", "lag_6", "lag_12"]].dropna()
         wlf_tr = wlf.loc[wlf.index.intersection(tr_index)]
         wlf_va = wlf.loc[wlf.index.intersection(val_index)]
+        wblend_weights, ols_beta = None, None
 
         if not wlf_tr.empty and not wlf_va.empty:
+            # Weighted Lag Blend (tune on TRAIN)
             best_w, best_s = (1.0, 0.0, 0.0), np.inf
             ytr = wlf_tr["y"].values
             l3  = wlf_tr["lag_3"].values
             l6  = wlf_tr["lag_6"].values
             l12 = wlf_tr["lag_12"].values
-
             for w3, w6, w12 in weight_grid(GRID_STEP, MIN_W12):
                 yhat = w3*l3 + w6*l6 + w12*l12
                 s = smape(ytr, yhat)
                 if np.isfinite(s) and s < best_s:
                     best_s, best_w = s, (w3, w6, w12)
-
             wblend_weights = {"w3": best_w[0], "w6": best_w[1], "w12": best_w[2]}
             preds["WeightedLagBlend"] = pd.Series(
                 best_w[0]*wlf_va["lag_3"].values
@@ -254,36 +288,32 @@ try:
                 + best_w[2]*wlf_va["lag_12"].values,
                 index=wlf_va.index, dtype=float
             )
-        else:
-            wblend_weights = None
 
-        # ========== E) OLS (log-space, closed form) ==========
-        ols_tr = wlf_tr
-        ols_va = wlf_va
-        if not ols_tr.empty and not ols_va.empty:
+            # OLS (log-space)
             Xtr = np.column_stack([
-                np.ones(len(ols_tr)),
-                ols_tr["lag_3"].values,
-                ols_tr["lag_6"].values,
-                ols_tr["lag_12"].values,
+                np.ones(len(wlf_tr)),
+                wlf_tr["lag_3"].values,
+                wlf_tr["lag_6"].values,
+                wlf_tr["lag_12"].values,
             ]).astype(np.float64)
-            ytr = ols_tr["y"].values.astype(np.float64)
-            beta = fit_ols_logspace(Xtr, ytr)
-
+            beta = fit_ols_logspace(Xtr, wlf_tr["y"].values.astype(np.float64))
             Xva = np.column_stack([
-                np.ones(len(ols_va)),
-                ols_va["lag_3"].values,
-                ols_va["lag_6"].values,
-                ols_va["lag_12"].values,
+                np.ones(len(wlf_va)),
+                wlf_va["lag_3"].values,
+                wlf_va["lag_6"].values,
+                wlf_va["lag_12"].values,
             ]).astype(np.float64)
-            preds["OLS"] = pd.Series(predict_ols_logspace(Xva, beta), index=ols_va.index, dtype=float)
+            preds["OLS"] = pd.Series(predict_ols_logspace(Xva, beta), index=wlf_va.index, dtype=float)
             ols_beta = beta
-        else:
-            ols_beta = None
 
-        # Score all models on SMAPE (align by index intersection per model)
+        # New models (validation)
+        preds["ARIMA"]       = arima_val_series(ts, val_index)
+        preds["HoltWinters"] = holtwinters_val_series(ts, val_index)
+        preds["MA_GrowthAdj"]= magr_val_series(ts, val_index)
+
+        # -------------------- Evaluate (SMAPE) --------------------
         smapes = {}
-        for m, pser in preds.items():  # pser is a Series
+        for m, pser in preds.items():
             if not isinstance(pser, pd.Series):
                 pser = pd.Series(pser, index=val_index, dtype=float)
             y_true = ts.reindex(pser.index).astype(float)
@@ -304,9 +334,9 @@ try:
             logger.info(f"· Skipping {cid:<25} – no models could be evaluated (insufficient overlapping windows).")
             continue
 
-        # Select best model; tie broken by fixed priority order
+        # Selection with tie-break priority
         priority = ["SeasonalNaive3mDiffGR", "SeasonalNaiveGR", "SeasonalNaive",
-                    "WeightedLagBlend", "OLS"]
+                    "WeightedLagBlend", "OLS", "ARIMA", "HoltWinters", "MA_GrowthAdj"]
         best_model = min(smapes, key=lambda k: (smapes[k], priority.index(k) if k in priority else 999))
         logger.info(f"· {cid:<25} Best = {best_model:<20} (SMAPE: {smapes[best_model]:.2f})")
 
@@ -321,71 +351,105 @@ try:
         fx_tag = f"{FX_ID_PREFIX[best_model]}_{STAMP:%Y%m%d}"
         load_ts_str = STAMP.strftime("%Y-%m-%d %H:%M:%S")
 
-        for d in future_idx:
-            n = len(hist)
-
-            if best_model == "SeasonalNaive":
-                base = hist[-12] if n >= 12 else hist[-1]
-                pred = float(base)
-
-            elif best_model == "SeasonalNaiveGR":
-                base = hist[-12] if n >= 12 else hist[-1]
-                if n >= 6:
-                    cur3  = list(hist)[-3:]
-                    prev3 = list(hist)[-6:-3]
-                    prev_mean = float(np.mean(prev3))
-                    r = (float(np.mean(cur3)) / prev_mean - 1.0) if prev_mean > 0 else 0.0
-                else:
-                    r = 0.0
-                pred = float(base) * (1.0 + r)
-
-            elif best_model == "SeasonalNaive3mDiffGR":
-                base = hist[-12] if n >= 12 else hist[-1]
-                if n >= 6:
-                    cur3  = list(hist)[-3:]
-                    prev3 = list(hist)[-6:-3]
-                    prev_mean = float(np.mean(prev3))
-                    r = (float(np.mean(cur3)) / prev_mean - 1.0) if prev_mean > 0 else 0.0
-                else:
-                    r = 0.0
-                if n >= 18:
-                    win_py  = list(hist)[-15:-12]
-                    prev_py = list(hist)[-18:-15]
-                    prev_mean = float(np.mean(prev_py))
-                    rpy = (float(np.mean(win_py)) / prev_mean - 1.0) if prev_mean > 0 else 0.0
-                else:
-                    rpy = 0.0
-                pred = float(base) * (1.0 + (r - rpy))
-
-            elif best_model == "WeightedLagBlend" and wblend_weights is not None:
-                w3, w6, w12 = wblend_weights["w3"], wblend_weights["w6"], wblend_weights["w12"]
-                x3  = hist[-3]  if n >= 3  else hist[-1]
-                x6  = hist[-6]  if n >= 6  else hist[-1]
-                x12 = hist[-12] if n >= 12 else hist[-1]
-                pred = float(w3*x3 + w6*x6 + w12*x12)
-
-            elif best_model == "OLS" and ols_beta is not None:
-                x3  = hist[-3]  if n >= 3  else hist[-1]
-                x6  = hist[-6]  if n >= 6  else hist[-1]
-                x12 = hist[-12] if n >= 12 else hist[-1]
-                Xn  = np.array([[1.0, x3, x6, x12]], dtype=np.float64)
-                pred = float(predict_ols_logspace(Xn, ols_beta)[0])
-
-            else:
-                # Fallback: carry forward last value
-                pred = float(hist[-1])
-
-            pred = 0.0 if not np.isfinite(pred) else max(0.0, pred)
-            hist.append(pred)
-
+        def append_row(date_obj, value):
+            value = 0.0 if not np.isfinite(value) else max(0.0, float(value))
             forecasts.append({
-                "fx_date":   d.strftime("%Y-%m-01"),  # <-- fixed literal day
+                "fx_date":   date_obj.strftime("%Y-%m-01"),
                 "client_id": cid,
-                "fx_vol":    int(round(pred)),
+                "fx_vol":    int(round(value)),
                 "fx_id":     fx_tag,
                 "fx_status": "forecast",
                 "load_ts":   load_ts_str
             })
+
+        if best_model == "ARIMA":
+            try:
+                mod = ARIMA(ts.dropna(), order=(1,1,0), seasonal_order=(1,0,0,12))
+                res = mod.fit()
+                fc = res.forecast(FORECAST_HORIZON)
+                for d, p in zip(future_idx, fc):
+                    append_row(d, p)
+            except Exception as _:
+                logger.info(f"· {cid} – ARIMA forecast failed; skipping client.")
+                continue
+
+        elif best_model == "HoltWinters":
+            try:
+                mod = ExponentialSmoothing(ts.dropna(), trend="add", seasonal="add", seasonal_periods=12)
+                res = mod.fit()
+                fc = res.forecast(FORECAST_HORIZON)
+                for d, p in zip(future_idx, fc):
+                    append_row(d, p)
+            except Exception as _:
+                logger.info(f"· {cid} – HoltWinters forecast failed; skipping client.")
+                continue
+
+        elif best_model == "MA_GrowthAdj":
+            h = list(ts.dropna())
+            for d in future_idx:
+                if len(h) < 6:
+                    pred = h[-1]
+                else:
+                    ma3   = float(np.mean(h[-3:]))
+                    prev3 = float(np.mean(h[-6:-3]))
+                    r     = (ma3/prev3 - 1.0) if prev3 > 0 else 0.0
+                    pred  = ma3 * (1.0 + r)
+                h.append(pred)
+                append_row(d, pred)
+
+        else:
+            # Original recursive logic for the other five models
+            for d in future_idx:
+                n = len(hist)
+                if best_model == "SeasonalNaive":
+                    base = hist[-12] if n >= 12 else hist[-1]
+                    pred = float(base)
+
+                elif best_model == "SeasonalNaiveGR":
+                    base = hist[-12] if n >= 12 else hist[-1]
+                    if n >= 6:
+                        cur3 = np.mean(hist[-3:])
+                        prev3 = np.mean(hist[-6:-3])
+                        r = (cur3/prev3 - 1.0) if prev3 > 0 else 0.0
+                    else:
+                        r = 0.0
+                    pred = float(base) * (1.0 + r)
+
+                elif best_model == "SeasonalNaive3mDiffGR":
+                    base = hist[-12] if n >= 12 else hist[-1]
+                    if n >= 6:
+                        cur3 = np.mean(hist[-3:])
+                        prev3 = np.mean(hist[-6:-3])
+                        r = (cur3/prev3 - 1.0) if prev3 > 0 else 0.0
+                    else:
+                        r = 0.0
+                    if n >= 18:
+                        win_py = np.mean(hist[-15:-12])
+                        prev_py = np.mean(hist[-18:-15])
+                        rpy = (win_py/prev_py - 1.0) if prev_py > 0 else 0.0
+                    else:
+                        rpy = 0.0
+                    pred = float(base) * (1.0 + (r - rpy))
+
+                elif best_model == "WeightedLagBlend" and wblend_weights is not None:
+                    x3  = hist[-3]  if n >= 3  else hist[-1]
+                    x6  = hist[-6]  if n >= 6  else hist[-1]
+                    x12 = hist[-12] if n >= 12 else hist[-1]
+                    pred = wblend_weights["w3"]*x3 + wblend_weights["w6"]*x6 + wblend_weights["w12"]*x12
+
+                elif best_model == "OLS" and ols_beta is not None:
+                    x3  = hist[-3]  if n >= 3  else hist[-1]
+                    x6  = hist[-6]  if n >= 6  else hist[-1]
+                    x12 = hist[-12] if n >= 12 else hist[-1]
+                    Xn  = np.array([[1.0, x3, x6, x12]], dtype=np.float64)
+                    pred = float(predict_ols_logspace(Xn, ols_beta)[0])
+
+                else:
+                    # Fallback: carry-forward last value
+                    pred = float(hist[-1])
+
+                hist.append(pred)
+                append_row(d, pred)
 
         # Winner audit marker
         audit_rows.append({
@@ -396,7 +460,7 @@ try:
             "RMSE": np.nan
         })
 
-    # 5) Push to GBQ, deduplicate, save CSVs, log -----------------------------
+    # -------------------- Push to GBQ & save --------------------
     if not forecasts:
         logger.warning("No forecasts were generated. Exiting without GBQ writes.")
         sys.exit(0)
@@ -432,4 +496,5 @@ try:
     logger.info("✓ Workload forecasting script (Rpt 288) completed successfully.")
 
 except Exception as exc:
+    # On any unhandled error, log it and send a notification email
     email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
