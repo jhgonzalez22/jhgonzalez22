@@ -2,59 +2,21 @@
 """
 CX Platforms – Workload Drivers Forecast (TotalOrders)
 
-End-to-end pipeline:
-  1) Pull monthly client time series (TotalOrders only) from BigQuery.
-  2) Feature engineering limited to lags 3/6/12 to keep variance in check and avoid overfitting.
-  3) Benchmark 5 lightweight, robust models on the last 6 months (validation) with SMAPE:
+Pipeline:
+  1) Query monthly client time series (TotalOrders) from GBQ.
+  2) Build features: lags 3/6/12 only (to avoid overfitting).
+  3) Benchmark 4 models on the last 6 months with SMAPE:
        A) SeasonalNaive
-            - yhat_t = y[t-12]
-            - Pure yearly seasonality anchor. Strong when annual cycles dominate.
+       B) SeasonalNaiveGR
+       C) SeasonalNaive3mDiffGR
+       D) WeightedLagBlend
+  4) Select best model per client (lowest SMAPE).
+  5) Produce recursive 15-month forecast with the winner.
+  6) Push results to GBQ, inactivate older rows, save CSVs, log.
 
-       B) SeasonalNaiveGR (seasonal plus short-term momentum)
-            - yhat_t = y[t-12] * (1 + r_recent)
-            - r_recent(t) = mean(y[t-3:t]) / mean(y[t-6:t-3]) - 1
-            - Keeps annual seasonality while nudging toward short-term growth/decline.
-
-       C) SeasonalNaive3mDiffGR (seasonal + recent growth corrected by prior-year window growth)
-            - yhat_t = y[t-12] * (1 + (r_recent - r_py))
-            - r_py(t) = mean(y[t-15:t-12]) / mean(y[t-18:t-15]) - 1
-            - Mitigates false momentum by comparing against last year's same 3-month window.
-
-       D) WeightedLagBlend (3/6/12)
-            - yhat_t = w3 * lag_3 + w6 * lag_6 + w12 * lag_12, subject to w >= 0, sum(w) = 1
-            - We tune (w3, w6, w12) on TRAIN ONLY via grid-search to minimize SMAPE.
-            - Captures momentum (3/6) + annual signal (12) without overparameterization.
-
-       E) OLS (log-space, closed-form)
-            - Model: log1p(y) = β0 + β1*lag3 + β2*lag6 + β3*lag12
-            - Solve by least squares (closed form) on TRAIN ONLY; predict then expm1.
-            - Log-transform stabilizes variance; expm1 returns to original scale.
-
-     * Seasonal models attempt whenever their required windows exist. They don’t require full lag rows.
-     * Lag-based models evaluate only where lag_3/6/12 exist (we never hard-stop a client for “insufficient history”).
-     * Validation window is the last 6 months; training is everything before that.
-     * We validate with SMAPE for robustness to zeros and scale.
-
-  4) For each client, select the lowest-SMAPE model (tie-breaks favor seasonalized forms).
-  5) Produce a recursive 15-month forecast with the winning model.
-     - We forecast one month ahead at a time, append the prediction to the history, and move forward.
-     - This mimics how features (lags) would be available in production month by month.
-  6) Append to GBQ, inactivate older duplicates, save CSVs, and log success.
-
-Output FX schema (BigQuery):
-  fx_date   (YYYY-MM-01)
-  client_id
-  fx_vol    (int)
-  fx_id     (model_prefix_YYYYMMDD)
-  fx_status ("forecast" for newest load; older rows updated to "inactive")
-  load_ts   (timestamp of this job run, local Chicago)
-
-Design choices & rationale:
-  • Lags restricted to 3/6/12: captures short-term momentum + annual seasonality, reduces variance.
-  • SMAPE metric: symmetric, handles zeros; appropriate for volume series with occasional zeros.
-  • Closed-form OLS: no external dependencies; very fast; stable with log1p.
-  • WeightedLagBlend: convex combination regularizes against overfitting and gives interpretable contributions.
-  • Seasonal family: strong baselines for weekly/monthly business cycles with minimal complexity.
+Why only these 4?
+  • OLS removed – recursive forecasts can blow up after a few months.
+  • ARIMA/HoltWinters removed – too heavy, not stable enough cross-clients.
 """
 
 # ------------------- standard imports -----------------------
@@ -64,11 +26,9 @@ from collections import deque
 
 import numpy as np
 import pandas as pd
-
 warnings.filterwarnings("ignore")
 
 # ------------------- helper-package path --------------------
-# Ensure the path to your scripthelper module is correct for your PC
 sys.path.append(r'C:\WFM_Scripting\Automation')
 from scripthelper import Config, Logger, BigQueryManager, EmailManager
 
@@ -85,427 +45,226 @@ SELECT
   client_id,
   TotalOrders  AS target_volume
 FROM `tax_clnt_svcs.view_cx_nontax_platforms_workload_drivers`
--- Use all months strictly before the current month to avoid partials
 WHERE MonthOfOrder < DATE_TRUNC(CURRENT_DATE(), MONTH)
 """
 DEST_TABLE = "tax_clnt_svcs.cx_nontax_platforms_workload_drivers_fx"
 
-# --- Local CSV outputs (Windows paths) ---
-LOCAL_CSV = r"C:\WFM_Scripting\cx_nontax_workload_drivers_fx_results.csv"        # forecasts (FX schema)
-AUDIT_CSV = r"C:\WFM_Scripting\cx_nontax_workload_drivers_fx_model_eval.csv"     # per-client per-model metrics
+LOCAL_CSV = r"C:\WFM_Scripting\cx_nontax_workload_drivers_fx_results.csv"
+AUDIT_CSV = r"C:\WFM_Scripting\cx_nontax_workload_drivers_fx_model_eval.csv"
 
 # ------------------- parameters -----------------------------
-FORECAST_HORIZON = 15      # months ahead for production forecast
-TEST_LEN         = 6       # last 6 months for validation (holdout)
+FORECAST_HORIZON = 15
+TEST_LEN         = 6
 LAGS             = (3, 6, 12)
-GRID_STEP        = 0.05    # Weight grid step for WeightedLagBlend
-MIN_W12          = 0.0     # allow zero; set >0.0 to enforce a minimum seasonal weight
+GRID_STEP        = 0.05
+MIN_W12          = 0.0
 
 STAMP_TZ = pytz.timezone("America/Chicago")
 STAMP    = datetime.now(STAMP_TZ)
 
-# Prefix per model for fx_id
 FX_ID_PREFIX = {
     "SeasonalNaive":           "snaive_workload",
     "SeasonalNaiveGR":         "snaive_gr_workload",
     "SeasonalNaive3mDiffGR":   "snaive_diffgr_workload",
     "WeightedLagBlend":        "wblend_workload",
-    "OLS":                     "ols_workload",
 }
 
 # ------------------- metrics -------------------------------
 def smape(a, f):
-    """
-    Symmetric MAPE (%).
-    Robust to zeros and scale. Lower is better.
-    """
-    a = np.asarray(a, dtype=float)
-    f = np.asarray(f, dtype=float)
+    a, f = np.asarray(a, float), np.asarray(f, float)
     denom = (np.abs(a) + np.abs(f)) / 2.0
     out = np.where(denom == 0.0, 0.0, np.abs(a - f) / denom)
     return float(np.mean(out) * 100.0)
 
 def mape(a, f):
-    """Standard MAPE (%), guarded for zeros in actuals."""
-    a = np.asarray(a, dtype=float)
-    f = np.asarray(f, dtype=float)
+    a, f = np.asarray(a, float), np.asarray(f, float)
     return float(np.mean(np.abs((a - f) / np.where(a == 0, 1, a))) * 100.0)
 
 def rmse(a, f):
-    """Root Mean Squared Error (scale-sensitive)."""
-    a = np.asarray(a, dtype=float)
-    f = np.asarray(f, dtype=float)
+    a, f = np.asarray(a, float), np.asarray(f, float)
     return float(np.sqrt(np.mean((a - f) ** 2)))
 
-# ------------------- helpers: features & windows ------------
+# ------------------- helpers: lags + growth -----------------
 def add_lags(ts: pd.Series) -> pd.DataFrame:
-    """
-    Return DataFrame with:
-      y, lag_3, lag_6, lag_12
-    Only these lags are used to limit degrees of freedom (avoid overfitting),
-    while still capturing short-term momentum (3/6) and annual seasonality (12).
-    """
     df = pd.DataFrame({"y": ts})
     for L in LAGS:
         df[f"lag_{L}"] = df["y"].shift(L)
     return df
 
 def recent_3m_growth(ts: pd.Series, pos: int) -> float:
-    """
-    r_recent(t) = mean(y[t-3:t]) / mean(y[t-6:t-3]) - 1
-    Captures near-term momentum without differentiating the series.
-    """
-    if pos < 6:
-        return 0.0
-    cur3  = ts.iloc[pos-3:pos].values.astype(float)
-    prev3 = ts.iloc[pos-6:pos-3].values.astype(float)
-    prev_mean = float(np.mean(prev3))
-    return (float(np.mean(cur3)) / prev_mean - 1.0) if prev_mean > 0 else 0.0
+    if pos < 6: return 0.0
+    cur3  = ts.iloc[pos-3:pos].values
+    prev3 = ts.iloc[pos-6:pos-3].values
+    prev_mean = np.mean(prev3)
+    return (np.mean(cur3) / prev_mean - 1.0) if prev_mean > 0 else 0.0
 
 def prior_year_3m_growth(ts: pd.Series, pos: int) -> float:
-    """
-    r_py(t) = mean(y[t-15:t-12]) / mean(y[t-18:t-15]) - 1
-    Seasonal control: compares prior-year same 3-month window to the preceding 3-month window.
-    """
-    if pos < 18:
-        return 0.0
-    win_py  = ts.iloc[pos-15:pos-12].values.astype(float)
-    prev_py = ts.iloc[pos-18:pos-15].values.astype(float)
-    prev_mean = float(np.mean(prev_py))
-    return (float(np.mean(win_py)) / prev_mean - 1.0) if prev_mean > 0 else 0.0
+    if pos < 18: return 0.0
+    win_py  = ts.iloc[pos-15:pos-12].values
+    prev_py = ts.iloc[pos-18:pos-15].values
+    prev_mean = np.mean(prev_py)
+    return (np.mean(win_py) / prev_mean - 1.0) if prev_mean > 0 else 0.0
 
-# ------------------- seasonal models (validation) -----------
-def seasonal_naive_series(ts: pd.Series, idx: pd.DatetimeIndex) -> pd.Series:
-    """
-    A) SeasonalNaive: yhat_t = y[t-12]
-    Pure seasonal anchor. Excellent baseline when strong annual seasonality exists.
-    """
+# ------------------- models (validation) -------------------
+def seasonal_naive_series(ts, idx):
     return ts.shift(12).reindex(idx)
 
-def seasonal_naive_gr_series(ts: pd.Series, idx: pd.DatetimeIndex) -> pd.Series:
-    """
-    B) SeasonalNaiveGR: yhat_t = y[t-12] * (1 + r_recent)
-    Blends annual seasonality with short-term 3-month momentum.
-    """
-    out = []
-    s12 = ts.shift(12)
+def seasonal_naive_gr_series(ts, idx):
+    out, s12 = [], ts.shift(12)
     for d in idx:
         base = s12.get(d, np.nan)
-        if not np.isfinite(base) or (d not in ts.index):
+        if not np.isfinite(base) or d not in ts.index:
             out.append(np.nan); continue
         pos = ts.index.get_loc(d)
         r   = recent_3m_growth(ts, pos)
-        out.append(max(0.0, float(base) * (1.0 + r)))
+        out.append(max(0.0, base * (1.0 + r)))
     return pd.Series(out, index=idx, dtype=float)
 
-def seasonal_naive_3m_diff_gr_series(ts: pd.Series, idx: pd.DatetimeIndex) -> pd.Series:
-    """
-    C) SeasonalNaive3mDiffGR: yhat_t = y[t-12] * (1 + (r_recent - r_py))
-    Corrects recent growth by subtracting last year's same-window growth.
-    This avoids overreacting to temporary effects repeated every year.
-    """
-    out = []
-    s12 = ts.shift(12)
+def seasonal_naive_3m_diff_gr_series(ts, idx):
+    out, s12 = [], ts.shift(12)
     for d in idx:
         base = s12.get(d, np.nan)
-        if not np.isfinite(base) or (d not in ts.index):
+        if not np.isfinite(base) or d not in ts.index:
             out.append(np.nan); continue
         pos = ts.index.get_loc(d)
         r  = recent_3m_growth(ts, pos)
         rp = prior_year_3m_growth(ts, pos)
-        out.append(max(0.0, float(base) * (1.0 + (r - rp))))
+        out.append(max(0.0, base * (1.0 + (r - rp))))
     return pd.Series(out, index=idx, dtype=float)
 
-# ------------------- Weighted Lag Blend ---------------------
 def weight_grid(step=GRID_STEP, min_w12=MIN_W12):
-    """
-    Generate convex triplets (w3, w6, w12):
-      w >= 0, w3 + w6 + w12 = 1, and w12 >= min_w12 if specified.
-    We keep the grid coarse (e.g., 0.05) to be fast and robust.
-    """
     vals = np.arange(0.0, 1.0 + 1e-9, step)
     for w3 in vals:
         for w6 in vals:
             w12 = 1.0 - (w3 + w6)
-            if w12 < -1e-12:
-                continue
+            if w12 < -1e-12: continue
             w12 = max(0.0, w12)
             if w12 + 1e-12 >= min_w12:
-                yield (float(w3), float(w6), float(w12))
-
-# ------------------- OLS (log-space, closed form) -----------
-def fit_ols_logspace(X: np.ndarray, y: np.ndarray):
-    """
-    Solve β for log1p(y) = Xβ on TRAIN ONLY.
-    - X must include an intercept column of ones.
-    - We coerce to float and sanitize y before log1p.
-    """
-    X = np.asarray(X, dtype=np.float64)
-    y = np.asarray(y, dtype=np.float64)
-    y = np.where(np.isfinite(y), y, 0.0)
-    y = np.clip(y, 0.0, None)
-    y_log = np.log1p(y)
-    beta, *_ = np.linalg.lstsq(X, y_log, rcond=None)
-    return beta
-
-def predict_ols_logspace(X: np.ndarray, beta: np.ndarray) -> np.ndarray:
-    """
-    Predict y via:
-      z = Xβ  (log space) → yhat = expm1(clip(z))
-    """
-    X = np.asarray(X, dtype=np.float64)
-    beta = np.asarray(beta, dtype=np.float64)
-    z = X @ beta
-    z = np.clip(z, -20.0, 20.0)  # numerical safety against extreme logs
-    return np.expm1(z)
+                yield (w3, w6, w12)
 
 # ------------------- MAIN -----------------------------------
 try:
-    logger.info("Starting Workload Forecasting Script (Rpt 288, GBQ)…")
+    logger.info("Starting Workload Forecasting Script (Rpt 288)…")
 
-    # 1) Pull data ------------------------------------------------------------
-    logger.info("Querying WD view (TotalOrders only)…")
+    # 1) Pull data ------------------------------------------------
     wd_df = bigquery_manager.run_gbq_sql(GBQ_VIEW_QUERY, return_dataframe=True)
-    if not isinstance(wd_df, pd.DataFrame) or wd_df.empty:
-        raise ValueError("Workload view returned no data.")
-
+    if wd_df.empty: raise ValueError("No data returned.")
     wd_df["date"] = pd.to_datetime(wd_df["date"])
     wd_df = wd_df.sort_values(["client_id", "date"])
 
     forecasts, audit_rows = [], []
 
-    # 2) Iterate per client ---------------------------------------------------
+    # 2) Iterate clients -----------------------------------------
     for cid, g in wd_df.groupby("client_id", sort=False):
-        # Base monthly series at MS frequency
         ts = g.set_index("date")["target_volume"].asfreq("MS").sort_index()
+        ts_model = ts.ffill().bfill()  # stabilize lags
 
-        # Modeling fill:
-        # We forward-fill/back-fill only for modeling (to prevent NaN-driven breaks).
-        # The evaluation still uses these filled values—this stabilizes scoring when source has gaps.
-        ts_model = ts.ffill().bfill()
-
-        # Build lag frame on filled series (ensures lag availability as soon as enough history exists)
         feat = add_lags(ts_model)
-
         if feat.shape[0] <= TEST_LEN:
-            logger.info(f"· Skipping {cid:<25} – not enough rows to form a {TEST_LEN}-month validation window.")
+            logger.info(f"· Skipping {cid} – not enough history.")
             continue
 
-        # Train/Validation split (last 6 months = validation window)
         val_index = feat.index[-TEST_LEN:]
         tr_index  = feat.index[:-TEST_LEN]
 
-        # -------------------- Predictions dict (Series) -----------------------
         preds = {}
-
-        # Seasonal family (operate directly on ts_model)
         preds["SeasonalNaive"]         = seasonal_naive_series(ts_model, val_index)
         preds["SeasonalNaiveGR"]       = seasonal_naive_gr_series(ts_model, val_index)
         preds["SeasonalNaive3mDiffGR"] = seasonal_naive_3m_diff_gr_series(ts_model, val_index)
 
-        # WeightedLagBlend & OLS require complete lag rows
-        wlf    = feat[["y", "lag_3", "lag_6", "lag_12"]].dropna()
-        wlf_tr = wlf.loc[wlf.index.intersection(tr_index)]
-        wlf_va = wlf.loc[wlf.index.intersection(val_index)]
-        wblend_weights, ols_beta = None, None
-
-        # D) WeightedLagBlend — tune weights on TRAIN ONLY, evaluate on VAL
+        # WeightedLagBlend
+        wlf_tr = feat.loc[tr_index].dropna()
+        wlf_va = feat.loc[val_index].dropna()
+        wblend_weights = None
         if not wlf_tr.empty and not wlf_va.empty:
-            best_w, best_s = (1.0, 0.0, 0.0), np.inf
-            ytr = wlf_tr["y"].values
-            l3  = wlf_tr["lag_3"].values
-            l6  = wlf_tr["lag_6"].values
-            l12 = wlf_tr["lag_12"].values
-            for w3, w6, w12 in weight_grid(GRID_STEP, MIN_W12):
-                yhat = w3*l3 + w6*l6 + w12*l12
-                s = smape(ytr, yhat)
+            best_w, best_s = (1,0,0), np.inf
+            for w3, w6, w12 in weight_grid():
+                yhat = w3*wlf_tr["lag_3"] + w6*wlf_tr["lag_6"] + w12*wlf_tr["lag_12"]
+                s = smape(wlf_tr["y"], yhat)
                 if np.isfinite(s) and s < best_s:
                     best_s, best_w = s, (w3, w6, w12)
             wblend_weights = {"w3": best_w[0], "w6": best_w[1], "w12": best_w[2]}
+            preds["WeightedLagBlend"] = (best_w[0]*wlf_va["lag_3"]
+                                       + best_w[1]*wlf_va["lag_6"]
+                                       + best_w[2]*wlf_va["lag_12"])
 
-            preds["WeightedLagBlend"] = pd.Series(
-                best_w[0]*wlf_va["lag_3"].values
-                + best_w[1]*wlf_va["lag_6"].values
-                + best_w[2]*wlf_va["lag_12"].values,
-                index=wlf_va.index, dtype=float
-            )
-
-            # E) OLS (log-space) — fit on TRAIN ONLY, evaluate on VAL
-            Xtr = np.column_stack([
-                np.ones(len(wlf_tr)),
-                wlf_tr["lag_3"].values,
-                wlf_tr["lag_6"].values,
-                wlf_tr["lag_12"].values,
-            ]).astype(np.float64)
-            beta = fit_ols_logspace(Xtr, wlf_tr["y"].values.astype(np.float64))
-            Xva = np.column_stack([
-                np.ones(len(wlf_va)),
-                wlf_va["lag_3"].values,
-                wlf_va["lag_6"].values,
-                wlf_va["lag_12"].values,
-            ]).astype(np.float64)
-            preds["OLS"] = pd.Series(predict_ols_logspace(Xva, beta), index=wlf_va.index, dtype=float)
-            ols_beta = beta
-
-        # -------------------- Evaluate (SMAPE) -------------------------------
+        # Evaluate
         smapes = {}
         for m, pser in preds.items():
-            # Ensure Series typed, aligned; evaluate against filled truth
-            if not isinstance(pser, pd.Series):
-                pser = pd.Series(pser, index=val_index, dtype=float)
+            pser = pd.Series(pser, index=val_index, dtype=float)
             y_true = ts_model.reindex(pser.index).astype(float)
             idx = y_true.index[y_true.notna() & pser.notna()]
-            if len(idx) > 0:
-                yv = y_true.loc[idx].to_numpy(dtype=float)
-                pv = pser.loc[idx].to_numpy(dtype=float)
+            if len(idx)>0:
+                yv, pv = y_true.loc[idx], pser.loc[idx]
                 smapes[m] = smape(yv, pv)
-                audit_rows.append({
-                    "client_id": cid,
-                    "model": m,
-                    "SMAPE": smapes[m],
-                    "MAPE": mape(yv, pv),
-                    "RMSE": rmse(yv, pv)
-                })
+                audit_rows.append({"client_id": cid, "model": m,
+                                   "SMAPE": smapes[m], "MAPE": mape(yv,pv), "RMSE": rmse(yv,pv)})
 
-        if not smapes:
-            logger.info(f"· Skipping {cid:<25} – no models could be evaluated (insufficient overlapping windows).")
-            continue
+        if not smapes: continue
+        priority = ["SeasonalNaive3mDiffGR", "SeasonalNaiveGR", "SeasonalNaive", "WeightedLagBlend"]
+        best_model = min(smapes, key=lambda k: (smapes[k], priority.index(k)))
+        logger.info(f"· {cid} Best={best_model} (SMAPE {smapes[best_model]:.2f})")
 
-        # Selection with tie-break priority (favor seasonalized forms)
-        priority = ["SeasonalNaive3mDiffGR", "SeasonalNaiveGR", "SeasonalNaive",
-                    "WeightedLagBlend", "OLS"]
-        best_model = min(smapes, key=lambda k: (smapes[k], priority.index(k) if k in priority else 999))
-        logger.info(f"· {cid:<25} Best = {best_model:<20} (SMAPE: {smapes[best_model]:.2f})")
-
-        # ===== Recursive 15-month forecast with the winner ====================
-        # We grow the history month-by-month with predictions, so future lags exist.
+        # Recursive forecast
         hist = deque(ts_model.dropna().tolist(), maxlen=240)
-        if not hist:
-            logger.info(f"· Skipping {cid:<25} – No history after dropna().")
-            continue
-
         last_date = ts_model.index.max()
-        future_idx = pd.date_range(last_date, periods=FORECAST_HORIZON + 1, freq="MS")[1:]
+        future_idx = pd.date_range(last_date, periods=FORECAST_HORIZON+1, freq="MS")[1:]
         fx_tag = f"{FX_ID_PREFIX[best_model]}_{STAMP:%Y%m%d}"
         load_ts_str = STAMP.strftime("%Y-%m-%d %H:%M:%S")
 
-        def append_row(date_obj, value):
-            """
-            Ensure numeric safety, clip at 0 (no negatives in volumes),
-            then write one output row in the FX schema.
-            """
-            value = 0.0 if not np.isfinite(value) else max(0.0, float(value))
-            forecasts.append({
-                "fx_date":   date_obj.strftime("%Y-%m-01"),
-                "client_id": cid,
-                "fx_vol":    int(round(value)),
-                "fx_id":     fx_tag,
-                "fx_status": "forecast",
-                "load_ts":   load_ts_str
-            })
+        def append_row(d,v):
+            v = 0.0 if not np.isfinite(v) else max(0.0,float(v))
+            forecasts.append({"fx_date":d.strftime("%Y-%m-01"),"client_id":cid,
+                              "fx_vol":int(round(v)),"fx_id":fx_tag,
+                              "fx_status":"forecast","load_ts":load_ts_str})
 
-        # Forecast logic per winner (uses only past information at each step)
         for d in future_idx:
-            n = len(hist)
-            last_list = list(hist)  # safe slicing
-
-            if best_model == "SeasonalNaive":
-                base = last_list[-12] if n >= 12 else last_list[-1]
-                pred = float(base)
-
-            elif best_model == "SeasonalNaiveGR":
-                base = last_list[-12] if n >= 12 else last_list[-1]
-                if n >= 6:
-                    cur3  = np.mean(last_list[-3:])
-                    prev3 = np.mean(last_list[-6:-3])
-                    r = (cur3/prev3 - 1.0) if prev3 > 0 else 0.0
-                else:
-                    r = 0.0
-                pred = float(base) * (1.0 + r)
-
-            elif best_model == "SeasonalNaive3mDiffGR":
-                base = last_list[-12] if n >= 12 else last_list[-1]
-                if n >= 6:
-                    cur3  = np.mean(last_list[-3:])
-                    prev3 = np.mean(last_list[-6:-3])
-                    r = (cur3/prev3 - 1.0) if prev3 > 0 else 0.0
-                else:
-                    r = 0.0
-                if n >= 18:
-                    win_py  = np.mean(last_list[-15:-12])
-                    prev_py = np.mean(last_list[-18:-15])
-                    rpy = (win_py/prev_py - 1.0) if prev_py > 0 else 0.0
-                else:
-                    rpy = 0.0
-                pred = float(base) * (1.0 + (r - rpy))
-
-            elif best_model == "WeightedLagBlend" and wblend_weights is not None:
-                x3  = last_list[-3]  if n >= 3  else last_list[-1]
-                x6  = last_list[-6]  if n >= 6  else last_list[-1]
-                x12 = last_list[-12] if n >= 12 else last_list[-1]
-                pred = wblend_weights["w3"]*x3 + wblend_weights["w6"]*x6 + wblend_weights["w12"]*x12
-
-            elif best_model == "OLS" and ols_beta is not None:
-                x3  = last_list[-3]  if n >= 3  else last_list[-1]
-                x6  = last_list[-6]  if n >= 6  else last_list[-1]
-                x12 = last_list[-12] if n >= 12 else last_list[-1]
-                Xn  = np.array([[1.0, x3, x6, x12]], dtype=np.float64)
-                pred = float(predict_ols_logspace(Xn, ols_beta)[0])
-
+            n, last_list = len(hist), list(hist)
+            if best_model=="SeasonalNaive":
+                pred = last_list[-12] if n>=12 else last_list[-1]
+            elif best_model=="SeasonalNaiveGR":
+                base = last_list[-12] if n>=12 else last_list[-1]
+                r=(np.mean(last_list[-3:])/np.mean(last_list[-6:-3])-1) if n>=6 else 0
+                pred=base*(1+r)
+            elif best_model=="SeasonalNaive3mDiffGR":
+                base = last_list[-12] if n>=12 else last_list[-1]
+                r=(np.mean(last_list[-3:])/np.mean(last_list[-6:-3])-1) if n>=6 else 0
+                rpy=(np.mean(last_list[-15:-12])/np.mean(last_list[-18:-15])-1) if n>=18 else 0
+                pred=base*(1+(r-rpy))
+            elif best_model=="WeightedLagBlend" and wblend_weights:
+                x3=last_list[-3] if n>=3 else last_list[-1]
+                x6=last_list[-6] if n>=6 else last_list[-1]
+                x12=last_list[-12] if n>=12 else last_list[-1]
+                pred=wblend_weights["w3"]*x3+wblend_weights["w6"]*x6+wblend_weights["w12"]*x12
             else:
-                # Defensive fallback: carry-forward last value
-                pred = float(last_list[-1])
+                pred=last_list[-1]
+            hist.append(pred); append_row(d,pred)
 
-            hist.append(pred)
-            append_row(d, pred)
+        audit_rows.append({"client_id":cid,"model":f"{best_model}_WINNER",
+                           "SMAPE":smapes[best_model],"MAPE":np.nan,"RMSE":np.nan})
 
-        # Winner audit marker (helps quickly see the chosen model per client)
-        audit_rows.append({
-            "client_id": cid,
-            "model": f"{best_model}_WINNER",
-            "SMAPE": smapes[best_model],
-            "MAPE": np.nan,
-            "RMSE": np.nan
-        })
-
-    # 3) Push to GBQ, deduplicate, save CSVs, log -----------------------------
-    if not forecasts:
-        logger.warning("No forecasts were generated. Exiting without GBQ writes.")
-        sys.exit(0)
-
-    fx_df = pd.DataFrame(forecasts)[["fx_date", "client_id", "fx_vol", "fx_id", "fx_status", "load_ts"]]
-    logger.info(f"Appending {len(fx_df):,} forecast rows to {DEST_TABLE}…")
-    ok = bigquery_manager.import_data_to_bigquery(
-        fx_df, DEST_TABLE, gbq_insert_action="append", auto_convert_df=True
-    )
-    if not ok:
-        raise Exception("Failed to append forecast data to BigQuery.")
-
-    # Inactivate older overlapping rows (keep only the newest load_ts as 'forecast')
-    logger.info("Inactivating older overlapping forecasts in destination table…")
-    dedup_sql = f"""
-    UPDATE `{DEST_TABLE}` AS t
-    SET fx_status = 'inactive'
-    WHERE EXISTS (
-        SELECT 1
-        FROM `{DEST_TABLE}` AS sub
-        WHERE sub.client_id = t.client_id
-          AND sub.fx_date   = t.fx_date
-          AND sub.load_ts   > t.load_ts
-    );
-    """
-    bigquery_manager.run_gbq_sql(dedup_sql, return_dataframe=False)
-    logger.info("✓ Older forecast rows marked as inactive.")
-
-    # Save local CSVs (forecasts + audit metrics)
-    fx_df.to_csv(LOCAL_CSV, index=False)
-    pd.DataFrame(audit_rows).to_csv(AUDIT_CSV, index=False)
-    logger.info(f"✓ Local CSVs saved:\n    - {LOCAL_CSV}\n    - {AUDIT_CSV}")
-
-    # Log success to GBQ audit table (per your helper)
-    bigquery_manager.update_log_in_bigquery()
-    logger.info("✓ Workload forecasting script (Rpt 288) completed successfully.")
+    # 3) Push to GBQ + dedup + save --------------------------------
+    if forecasts:
+        fx_df=pd.DataFrame(forecasts)
+        bigquery_manager.import_data_to_bigquery(fx_df, DEST_TABLE,
+                                                 gbq_insert_action="append",
+                                                 auto_convert_df=True)
+        dedup_sql=f"""
+        UPDATE `{DEST_TABLE}` t
+        SET fx_status='inactive'
+        WHERE EXISTS (
+          SELECT 1 FROM `{DEST_TABLE}` sub
+          WHERE sub.client_id=t.client_id AND sub.fx_date=t.fx_date
+            AND sub.load_ts>t.load_ts
+        );
+        """
+        bigquery_manager.run_gbq_sql(dedup_sql, return_dataframe=False)
+        fx_df.to_csv(LOCAL_CSV,index=False)
+        pd.DataFrame(audit_rows).to_csv(AUDIT_CSV,index=False)
+        bigquery_manager.update_log_in_bigquery()
+        logger.info("✓ Forecasting complete.")
+    else:
+        logger.warning("No forecasts generated.")
 
 except Exception as exc:
-    # On any unhandled error, log it and send a notification email
     email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
