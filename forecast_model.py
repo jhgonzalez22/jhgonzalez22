@@ -1,4 +1,3 @@
-# ───────────────── workload_forecast_multi_model.py ─────────────────
 """
 CX Platforms – Workload Drivers Forecast (TotalOrders)
 
@@ -14,9 +13,9 @@ Pipeline:
   5) Produce recursive 15-month forecast with the winner.
   6) Push results to GBQ, inactivate older rows, save CSVs, log.
 
-Why only these 4?
-  • OLS removed – recursive forecasts can blow up after a few months.
-  • ARIMA/HoltWinters removed – too heavy, not stable enough cross-clients.
+fx_status legend:
+  A = Active forecast (latest run)
+  I = Inactive (older forecasts deactivated by dedup query)
 """
 
 # ------------------- standard imports -----------------------
@@ -71,6 +70,7 @@ FX_ID_PREFIX = {
 
 # ------------------- metrics -------------------------------
 def smape(a, f):
+    """Symmetric MAPE: measures forecast accuracy as percentage."""
     a, f = np.asarray(a, float), np.asarray(f, float)
     denom = (np.abs(a) + np.abs(f)) / 2.0
     out = np.where(denom == 0.0, 0.0, np.abs(a - f) / denom)
@@ -86,12 +86,14 @@ def rmse(a, f):
 
 # ------------------- helpers: lags + growth -----------------
 def add_lags(ts: pd.Series) -> pd.DataFrame:
+    """Create lag features (3,6,12 months)."""
     df = pd.DataFrame({"y": ts})
     for L in LAGS:
         df[f"lag_{L}"] = df["y"].shift(L)
     return df
 
 def recent_3m_growth(ts: pd.Series, pos: int) -> float:
+    """Growth = mean(last 3m) / mean(prev 3m) - 1."""
     if pos < 6: return 0.0
     cur3  = ts.iloc[pos-3:pos].values
     prev3 = ts.iloc[pos-6:pos-3].values
@@ -99,6 +101,7 @@ def recent_3m_growth(ts: pd.Series, pos: int) -> float:
     return (np.mean(cur3) / prev_mean - 1.0) if prev_mean > 0 else 0.0
 
 def prior_year_3m_growth(ts: pd.Series, pos: int) -> float:
+    """Prior-year growth = same 3m window last year vs year before."""
     if pos < 18: return 0.0
     win_py  = ts.iloc[pos-15:pos-12].values
     prev_py = ts.iloc[pos-18:pos-15].values
@@ -107,9 +110,19 @@ def prior_year_3m_growth(ts: pd.Series, pos: int) -> float:
 
 # ------------------- models (validation) -------------------
 def seasonal_naive_series(ts, idx):
+    """
+    A) SeasonalNaive:
+    - Forecast = value from same month last year (y[t-12]).
+    - Captures pure yearly seasonality.
+    """
     return ts.shift(12).reindex(idx)
 
 def seasonal_naive_gr_series(ts, idx):
+    """
+    B) SeasonalNaiveGR:
+    - Forecast = y[t-12] * (1 + recent 3m growth).
+    - Adjusts last year’s seasonal value by short-term trend.
+    """
     out, s12 = [], ts.shift(12)
     for d in idx:
         base = s12.get(d, np.nan)
@@ -121,6 +134,12 @@ def seasonal_naive_gr_series(ts, idx):
     return pd.Series(out, index=idx, dtype=float)
 
 def seasonal_naive_3m_diff_gr_series(ts, idx):
+    """
+    C) SeasonalNaive3mDiffGR:
+    - Forecast = y[t-12] * (1 + (recent growth - prior-year growth)).
+    - Corrects last year’s seasonal pattern by how current growth differs
+      from the same window last year.
+    """
     out, s12 = [], ts.shift(12)
     for d in idx:
         base = s12.get(d, np.nan)
@@ -133,6 +152,7 @@ def seasonal_naive_3m_diff_gr_series(ts, idx):
     return pd.Series(out, index=idx, dtype=float)
 
 def weight_grid(step=GRID_STEP, min_w12=MIN_W12):
+    """Generate weight combos for lag3, lag6, lag12 that sum to 1."""
     vals = np.arange(0.0, 1.0 + 1e-9, step)
     for w3 in vals:
         for w6 in vals:
@@ -148,7 +168,11 @@ try:
 
     # 1) Pull data ------------------------------------------------
     wd_df = bigquery_manager.run_gbq_sql(GBQ_VIEW_QUERY, return_dataframe=True)
-    if wd_df.empty: raise ValueError("No data returned.")
+    if not isinstance(wd_df, pd.DataFrame):
+        raise ValueError(f"Expected DataFrame, got {type(wd_df)} instead.")
+    if wd_df.empty:
+        raise ValueError("No data returned from GBQ query.")
+
     wd_df["date"] = pd.to_datetime(wd_df["date"])
     wd_df = wd_df.sort_values(["client_id", "date"])
 
@@ -216,7 +240,7 @@ try:
             v = 0.0 if not np.isfinite(v) else max(0.0,float(v))
             forecasts.append({"fx_date":d.strftime("%Y-%m-01"),"client_id":cid,
                               "fx_vol":int(round(v)),"fx_id":fx_tag,
-                              "fx_status":"forecast","load_ts":load_ts_str})
+                              "fx_status":"A","load_ts":load_ts_str})
 
         for d in future_idx:
             n, last_list = len(hist), list(hist)
@@ -251,7 +275,7 @@ try:
                                                  auto_convert_df=True)
         dedup_sql=f"""
         UPDATE `{DEST_TABLE}` t
-        SET fx_status='inactive'
+        SET fx_status='I'
         WHERE EXISTS (
           SELECT 1 FROM `{DEST_TABLE}` sub
           WHERE sub.client_id=t.client_id AND sub.fx_date=t.fx_date
@@ -268,15 +292,3 @@ try:
 
 except Exception as exc:
     email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
-
-
-(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_288_File.py
-Traceback (most recent call last):
-  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 270, in <module>
-    email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
-  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1170, in handle_error
-    raise exception
-  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 151, in <module>
-    if wd_df.empty: raise ValueError("No data returned.")
-       ^^^^^^^^^^^
-AttributeError: 'bool' object has no attribute 'empty'
