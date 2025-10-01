@@ -122,15 +122,13 @@ def prior_year_3m_growth(ts: pd.Series, pos: int) -> float:
     prev_mean = float(np.mean(prev_py))
     return (float(np.mean(win_py)) / prev_mean - 1.0) if prev_mean > 0 else 0.0
 
-def seasonal_naive_val(ts: pd.Series, val_index: pd.DatetimeIndex) -> np.ndarray:
-    """yhat = y[t-12] (NaN if not available)."""
-    s12 = ts.shift(12)
-    return s12.reindex(val_index).to_numpy(dtype=float)
+def seasonal_naive_series(ts: pd.Series, idx: pd.DatetimeIndex) -> pd.Series:
+    """Series yhat = y[t-12] on idx (NaN where unavailable)."""
+    return ts.shift(12).reindex(idx)
 
-def seasonal_naive_gr_val(ts: pd.Series, val_index: pd.DatetimeIndex) -> np.ndarray:
-    """yhat = y[t-12] * (1 + r_recent)."""
+def seasonal_naive_gr_series(ts: pd.Series, idx: pd.DatetimeIndex) -> pd.Series:
     out = []
-    for d in val_index:
+    for d in idx:
         if d not in ts.index:
             out.append(np.nan); continue
         pos = ts.index.get_loc(d)
@@ -139,12 +137,11 @@ def seasonal_naive_gr_val(ts: pd.Series, val_index: pd.DatetimeIndex) -> np.ndar
             out.append(np.nan); continue
         r = recent_3m_growth(ts, pos)
         out.append(max(0.0, float(base) * (1.0 + r)))
-    return np.array(out, dtype=float)
+    return pd.Series(out, index=idx, dtype=float)
 
-def seasonal_naive_3m_diff_gr_val(ts: pd.Series, val_index: pd.DatetimeIndex) -> np.ndarray:
-    """yhat = y[t-12] * (1 + (r_recent - r_py))."""
+def seasonal_naive_3m_diff_gr_series(ts: pd.Series, idx: pd.DatetimeIndex) -> pd.Series:
     out = []
-    for d in val_index:
+    for d in idx:
         if d not in ts.index:
             out.append(np.nan); continue
         pos = ts.index.get_loc(d)
@@ -154,7 +151,7 @@ def seasonal_naive_3m_diff_gr_val(ts: pd.Series, val_index: pd.DatetimeIndex) ->
         r  = recent_3m_growth(ts, pos)
         rp = prior_year_3m_growth(ts, pos)
         out.append(max(0.0, float(base) * (1.0 + (r - rp))))
-    return np.array(out, dtype=float)
+    return pd.Series(out, index=idx, dtype=float)
 
 def weight_grid(step=GRID_STEP, min_w12=MIN_W12):
     vals = np.arange(0.0, 1.0 + 1e-9, step)
@@ -221,15 +218,16 @@ try:
         val_index = feat.index[-TEST_LEN:]
         tr_index  = feat.index[:-TEST_LEN]
 
-        # ========== A) SeasonalNaive ==========
         preds = {}
-        preds["SeasonalNaive"] = seasonal_naive_val(ts, val_index)
+
+        # ========== A) SeasonalNaive ==========
+        preds["SeasonalNaive"] = seasonal_naive_series(ts, val_index)
 
         # ========== B) SeasonalNaiveGR ==========
-        preds["SeasonalNaiveGR"] = seasonal_naive_gr_val(ts, val_index)
+        preds["SeasonalNaiveGR"] = seasonal_naive_gr_series(ts, val_index)
 
         # ========== C) SeasonalNaive3mDiffGR ==========
-        preds["SeasonalNaive3mDiffGR"] = seasonal_naive_3m_diff_gr_val(ts, val_index)
+        preds["SeasonalNaive3mDiffGR"] = seasonal_naive_3m_diff_gr_series(ts, val_index)
 
         # ========== D) WeightedLagBlend (TRAIN-only tuning) ==========
         wlf = feat[["y", "lag_3", "lag_6", "lag_12"]].dropna()
@@ -249,17 +247,18 @@ try:
                 if np.isfinite(s) and s < best_s:
                     best_s, best_w = s, (w3, w6, w12)
 
-            preds["WeightedLagBlend"] = (
+            wblend_weights = {"w3": best_w[0], "w6": best_w[1], "w12": best_w[2]}
+            preds["WeightedLagBlend"] = pd.Series(
                 best_w[0]*wlf_va["lag_3"].values
                 + best_w[1]*wlf_va["lag_6"].values
-                + best_w[2]*wlf_va["lag_12"].values
+                + best_w[2]*wlf_va["lag_12"].values,
+                index=wlf_va.index, dtype=float
             )
-            wblend_weights = {"w3": best_w[0], "w6": best_w[1], "w12": best_w[2]}
         else:
             wblend_weights = None
 
         # ========== E) OLS (log-space, closed form) ==========
-        ols_tr = wlf_tr  # requires complete lags
+        ols_tr = wlf_tr
         ols_va = wlf_va
         if not ols_tr.empty and not ols_va.empty:
             Xtr = np.column_stack([
@@ -277,24 +276,28 @@ try:
                 ols_va["lag_6"].values,
                 ols_va["lag_12"].values,
             ]).astype(np.float64)
-            preds["OLS"] = predict_ols_logspace(Xva, beta)
+            preds["OLS"] = pd.Series(predict_ols_logspace(Xva, beta), index=ols_va.index, dtype=float)
             ols_beta = beta
         else:
             ols_beta = None
 
-        # Score all models on SMAPE (only where both y and pred are finite)
+        # Score all models on SMAPE (align by index intersection per model)
         smapes = {}
-        y_val_full = ts.reindex(val_index).to_numpy(dtype=float)
-        for m, p in preds.items():
-            mask = np.isfinite(p) & np.isfinite(y_val_full)
-            if mask.any():
-                smapes[m] = smape(y_val_full[mask], p[mask])
+        for m, pser in preds.items():  # pser is a Series
+            if not isinstance(pser, pd.Series):
+                pser = pd.Series(pser, index=val_index, dtype=float)
+            y_true = ts.reindex(pser.index).astype(float)
+            idx = y_true.index[y_true.notna() & pser.notna()]
+            if len(idx) > 0:
+                yv = y_true.loc[idx].to_numpy(dtype=float)
+                pv = pser.loc[idx].to_numpy(dtype=float)
+                smapes[m] = smape(yv, pv)
                 audit_rows.append({
                     "client_id": cid,
                     "model": m,
                     "SMAPE": smapes[m],
-                    "MAPE": mape(y_val_full[mask], p[mask]),
-                    "RMSE": rmse(y_val_full[mask], p[mask])
+                    "MAPE": mape(yv, pv),
+                    "RMSE": rmse(yv, pv)
                 })
 
         if not smapes:
@@ -327,7 +330,6 @@ try:
 
             elif best_model == "SeasonalNaiveGR":
                 base = hist[-12] if n >= 12 else hist[-1]
-                # r_recent from the latest history (use same definition)
                 if n >= 6:
                     cur3  = list(hist)[-3:]
                     prev3 = list(hist)[-6:-3]
@@ -339,7 +341,6 @@ try:
 
             elif best_model == "SeasonalNaive3mDiffGR":
                 base = hist[-12] if n >= 12 else hist[-1]
-                # r_recent
                 if n >= 6:
                     cur3  = list(hist)[-3:]
                     prev3 = list(hist)[-6:-3]
@@ -347,7 +348,6 @@ try:
                     r = (float(np.mean(cur3)) / prev_mean - 1.0) if prev_mean > 0 else 0.0
                 else:
                     r = 0.0
-                # r_py (prior year same-window)
                 if n >= 18:
                     win_py  = list(hist)[-15:-12]
                     prev_py = list(hist)[-18:-15]
@@ -379,7 +379,7 @@ try:
             hist.append(pred)
 
             forecasts.append({
-                "fx_date":   d.strftime("%Y-%m-01"),
+                "fx_date":   d.strftime("%Y-%m-%01"),
                 "client_id": cid,
                 "fx_vol":    int(round(pred)),
                 "fx_id":     fx_tag,
@@ -433,15 +433,3 @@ try:
 
 except Exception as exc:
     email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
-
-
-(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_288_File.py
-Traceback (most recent call last):
-  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 435, in <module>
-    email_manager.handle_error("Workload Forecasting Script Failure (Rpt 288)", exc, is_test=True)
-  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1170, in handle_error
-    raise exception
-  File "c:\WFM_Scripting\Forecasting\Rpt_288_File.py", line 291, in <module>
-    smapes[m] = smape(y_val_full[mask], p[mask])
-                      ~~~~~~~~~~^^^^^^
-IndexError: only integers, slices (`:`), ellipsis (`...`), numpy.newaxis (`None`) and integer or boolean arrays are valid indices
