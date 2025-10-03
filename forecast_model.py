@@ -219,3 +219,36 @@ try:
 
 except Exception as exc:
     email_manager.handle_error("Credit Ticket Forecasting Script Failure", exc, is_test=True)
+
+(venv_Master) PS C:\WFM_Scripting\Automation> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Automation/testing2.py
+Traceback (most recent call last):
+  File "c:\WFM_Scripting\Automation\testing2.py", line 221, in <module>
+    email_manager.handle_error("Credit Ticket Forecasting Script Failure", exc, is_test=True)
+  File "c:\WFM_Scripting\Automation\scripthelper.py", line 1319, in handle_error
+    raise exception
+  File "c:\WFM_Scripting\Automation\testing2.py", line 173, in <module>
+    model = sm.OLS(y_train_log, X_train).fit()
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\regression\linear_model.py", line 921, in __init__
+    super().__init__(endog, exog, missing=missing,
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\regression\linear_model.py", line 746, in __init__
+    super().__init__(endog, exog, missing=missing,
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\regression\linear_model.py", line 200, in __init__
+    super().__init__(endog, exog, **kwargs)
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\base\model.py", line 270, in __init__
+    super().__init__(endog, exog, **kwargs)
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\base\model.py", line 95, in __init__
+    self.data = self._handle_data(endog, exog, missing, hasconst,
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\base\model.py", line 135, in _handle_data
+    data = handle_data(endog, exog, missing, hasconst, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\base\data.py", line 675, in handle_data
+    return klass(endog, exog=exog, missing=missing, hasconst=hasconst,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\base\data.py", line 84, in __init__
+    self.endog, self.exog = self._convert_endog_exog(endog, exog)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\base\data.py", line 509, in _convert_endog_exog
+    raise ValueError("Pandas data cast to numpy dtype of object. "
+ValueError: Pandas data cast to numpy dtype of object. Check input data with np.asarray(data).
