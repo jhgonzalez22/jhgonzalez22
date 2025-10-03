@@ -1,27 +1,24 @@
 """
-Credit Tickets - Monthly Volume Forecast — v1.17.2 (Final Hotfix+)
+Credit Tickets - Monthly Volume Forecast — v1.17.3 (Final Hotfix++)
 
-This version fixes two issues in v1.17 and hardens OLS dtype handling:
+What’s new vs v1.17.2:
+  • Target hygiene: treat `total_cases_opened` as the only target; prevent leakage
+  • OLS guardrails:
+      - Lasso pre-select → prune multicollinearity (|corr|>0.95) with priority-keep
+      - Feature cap to preserve degrees of freedom (DF)
+      - Always include seasonal anchor if present (lag_12), and force `trend` if only static market vars selected
+  • Robust inference:
+      - Build BOTH target lags and driver lags during recursion (k=1..12)
+      - Use driver FX when available; hold market vars flat at last known values
+      - Pure float matrices for statsmodels to avoid dtype errors
+  • SeasonalNaive branches build driver each step and update histories safely
 
-  1) **NameError in forecast loop** when the winner was a SeasonalNaive model
-     (the code referenced `row` that wasn’t defined). Now we build the driver
-     signal (`current_total_orders`) for *every* branch and update `drv_hist`
-     safely.
+Benchmarked models (6-month validation):
+  - XGBoost (log target)
+  - OLS_Auto_Market (Lasso feature select + guardrails)
+  - SeasonalNaive3mGR, SeasonalNaive3mDiffGR
 
-  2) **Missing driver lags at inference**. If OLS/XGB selected `drv_lag_*`
-     features, inference previously lacked those columns. We now compute BOTH
-     `lag_k` and `drv_lag_k` (k=1..12) during recursion.
-
-  3) **OLS dtype safety**. Endog/exog are passed to statsmodels as pure float
-     NumPy arrays to avoid the “Pandas data cast to numpy dtype of object”
-     error.
-
-Other notes retained from v1.17:
-  • 6-month validation
-  • Models benchmarked: XGBoost, OLS_Auto_Market (Lasso feature select + guardrail),
-    SeasonalNaive3mGR, SeasonalNaive3mDiffGR
-  • Guardrail: if Lasso selects only static market variables, we force in `trend`
-  • Local outputs for forecasts/audit/modeling/stats and XGB importances
+Local outputs: forecasts, audit, modeling, stats, XGB feature importances
 """
 
 # ------------------- standard imports -----------------------
@@ -93,7 +90,7 @@ def safe_expm1(x, lo=-20.0, hi=20.0):
     arr = np.asarray(x, dtype=float)
     return np.expm1(np.clip(arr, lo, hi))
 
-# includes mape() definition (fix from v1.17 description)
+# includes mape() definition (fix from v1.17)
 def safe_reg_metrics(y_true, y_pred):
     def mape(actual, forecast):
         actual, forecast = np.asarray(actual, dtype=float), np.asarray(forecast, dtype=float)
@@ -125,6 +122,45 @@ def perform_statistical_tests(group_data: pd.DataFrame, client_id: str):
         adf_p = adfuller(adf_series)[1]
         results['adf_p_value'], results['is_stationary'] = float(adf_p), bool(adf_p < 0.05)
     return results
+
+# ---------- collinearity pruning (priority-keep) ----------
+def prune_collinearity(X_df: pd.DataFrame, keep_priority: list, thr: float = 0.95) -> list:
+    """
+    Greedy pruning: keep features in priority order; drop any new feature whose
+    absolute correlation with any kept feature exceeds `thr`.
+    """
+    if X_df.shape[1] <= 1:
+        return X_df.columns.tolist()
+
+    # Order columns by (1) explicit priority, then (2) remaining columns by variance (proxy for info)
+    cols = X_df.columns.tolist()
+    prio = [c for c in keep_priority if c in cols]
+    rest = [c for c in cols if c not in prio]
+    # variance sort descending to prefer informative features
+    rest_sorted = sorted(rest, key=lambda c: np.nanvar(X_df[c].values), reverse=True)
+    ordered = prio + rest_sorted
+
+    kept = []
+    # Precompute correlation matrix once on rows w/o NA
+    Xc = X_df.dropna()
+    if Xc.shape[0] < 3:
+        return ordered[: min(6, len(ordered))]  # minimal fallback
+
+    corrM = Xc.corr(numeric_only=True).fillna(0.0)
+
+    for col in ordered:
+        if not kept:
+            kept.append(col)
+            continue
+        ok = True
+        for k in kept:
+            c = corrM.loc[k, col] if (k in corrM.index and col in corrM.columns) else 0.0
+            if np.abs(c) > thr:
+                ok = False
+                break
+        if ok:
+            kept.append(col)
+    return kept
 
 # ------------------- data fetching -------------------------
 def fetch_market_data(bq: BigQueryManager) -> pd.DataFrame:
@@ -173,7 +209,7 @@ def fetch_credit_driver_forecasts(bq: BigQueryManager) -> pd.DataFrame:
 
 # ------------------- MAIN EXECUTION -------------------------
 try:
-    logger.info("Starting Credit Ticket Forecasting Script (v1.17.2)...")
+    logger.info("Starting Credit Ticket Forecasting Script (v1.17.3)...")
 
     # Base tickets (monthly)
     TICKET_QUERY = """
@@ -228,8 +264,11 @@ try:
         client_df['trend'] = np.arange(len(client_df), dtype=float)
 
         ts = client_df.set_index('date')['total_cases_opened'].asfreq('MS')
-        # build modeling table
-        feat_all = pd.DataFrame({'y': ts}).join(client_df.set_index('date'))
+
+        # Build modeling table (NOTE: exclude total_cases_opened from features to avoid leakage)
+        feat_all = pd.DataFrame({'y': ts}).join(
+            client_df.set_index('date').drop(columns=['total_cases_opened'], errors='ignore')
+        )
 
         # Clean to numeric + drop any NA rows
         cols_to_clean = [c for c in feat_all.columns if c not in ['client_id', 'vol_type', 'date']]
@@ -247,7 +286,9 @@ try:
         train_df, val_df = feat_all.iloc[:-VAL_LEN_6M], feat_all.iloc[-VAL_LEN_6M:]
         y_tr_log = np.log1p(np.asarray(train_df['y'].values, dtype=float))
 
+        # Candidate features (target removed)
         candidate_cols = [c for c in feat_all.columns if c not in ['y', 'client_id', 'vol_type', 'date']]
+
         X_tr = train_df[candidate_cols].astype(float)
         X_val = val_df[candidate_cols].astype(float)
 
@@ -269,11 +310,13 @@ try:
         except Exception as e:
             logger.warning(f"{cid}: XGBoost failed: {e}")
 
-        # 2) OLS_Auto_Market (Lasso selection -> OLS refit) with guardrail
+        # 2) OLS_Auto_Market (Lasso selection -> prune -> cap -> OLS refit) with guardrails
         try:
+            # Scale for Lasso (selection only)
             scaler = StandardScaler(with_mean=True, with_std=True).fit(X_tr.values)
             X_tr_scaled = scaler.transform(X_tr.values)
 
+            # Cross-validated Lasso to pick a compact set
             lasso = LassoCV(cv=min(3, max(2, len(train_df)//4)),
                             random_state=42, n_alphas=100).fit(X_tr_scaled, y_tr_log)
             sel_idx = np.where(np.abs(lasso.coef_) > 1e-8)[0].tolist()
@@ -285,43 +328,59 @@ try:
                 logger.info(f"{cid}: Only market vars selected — forcing 'trend' into OLS.")
                 selected_feats.append('trend')
 
-            # Fallback: ensure at least something is selected
+            # If Lasso selected nothing, fallback to strong seasonal/lag signal
             if not selected_feats:
-                fallback = [c for c in ['lag_12', 'trend'] if c in candidate_cols]
-                if not fallback:
-                    # strongest single-corr fallback
+                fallback = [c for c in ['lag_12', 'lag_1', 'lag_2', 'lag_3', 'TotalOrders', 'drv_lag_1', 'trend', 'month'] if c in candidate_cols]
+                selected_feats = fallback[:4] if fallback else candidate_cols[:3]
+
+            # Prune multicollinearity with priority-keep
+            keep_priority = [c for c in ['lag_12', 'lag_1', 'lag_2', 'lag_3', 'TotalOrders', 'drv_lag_1', 'trend', 'month'] if c in candidate_cols]
+            pruned = prune_collinearity(train_df[selected_feats].astype(float), keep_priority, thr=0.95)
+
+            # Cap features to preserve DF: df_resid >= 5
+            n_obs = len(train_df)
+            max_feats = max(1, min(6, n_obs - 6))  # aim for at least ~6 residual DF
+            if len(pruned) > max_feats:
+                # Rank remaining by absolute correlation with y (log-space target for consistency)
+                ytmp = y_tr_log
+                feat_scores = []
+                for c in pruned:
+                    xv = train_df[c].values
+                    cor = np.corrcoef(ytmp, xv)[0,1] if np.isfinite(xv).sum() >= 3 else 0.0
+                    feat_scores.append((c, abs(float(cor)) if np.isfinite(cor) else 0.0))
+                pruned = [c for c, _ in sorted(feat_scores, key=lambda t: t[1], reverse=True)[:max_feats]]
+
+            # Make sure seasonal anchor is present if available
+            if 'lag_12' in candidate_cols and 'lag_12' not in pruned:
+                # If adding it would exceed max, replace the weakest
+                if len(pruned) >= max_feats:
+                    # drop weakest by abs corr
                     ytmp = y_tr_log
-                    corrs = {}
-                    for c in candidate_cols:
-                        xv = X_tr[c].values
-                        if np.isfinite(xv).sum() >= 3:
-                            try:
-                                cor = np.corrcoef(ytmp, xv)[0,1]
-                            except Exception:
-                                cor = 0.0
-                            corrs[c] = abs(float(cor)) if np.isfinite(cor) else 0.0
-                    fallback = [max(corrs, key=corrs.get)] if corrs else []
-                selected_feats = fallback
+                    corrs = [(c, abs(np.corrcoef(ytmp, train_df[c].values)[0,1]) if np.isfinite(train_df[c].values).sum()>=3 else 0.0) for c in pruned]
+                    weakest = sorted(corrs, key=lambda t: t[1])[0][0] if corrs else pruned[-1]
+                    pruned = [c for c in pruned if c != weakest]
+                pruned.append('lag_12')
 
-            if selected_feats:
-                Xtr_sel_df = train_df[selected_feats].astype(float)
-                Xval_sel_df = val_df[selected_feats].astype(float)
+            selected_feats = pruned
 
-                # PURE FLOAT arrays to statsmodels
-                Xtr_mat = sm.add_constant(Xtr_sel_df, has_constant='add').to_numpy(dtype=float)
-                Xval_mat = sm.add_constant(Xval_sel_df, has_constant='add').to_numpy(dtype=float)
+            # Refit OLS on selected_feats (pure float arrays)
+            Xtr_sel_df = train_df[selected_feats].astype(float)
+            Xval_sel_df = val_df[selected_feats].astype(float)
 
-                ols_auto = sm.OLS(y_tr_log, Xtr_mat).fit()
-                raw_val = ols_auto.predict(Xval_mat)
-                model_preds_val['OLS_Auto_Market'] = safe_expm1(raw_val)
-                model_meta['OLS_Auto_Market'] = {'model': ols_auto, 'features': selected_feats}
+            Xtr_mat = sm.add_constant(Xtr_sel_df, has_constant='add').to_numpy(dtype=float)
+            Xval_mat = sm.add_constant(Xval_sel_df, has_constant='add').to_numpy(dtype=float)
 
-                try:
-                    all_model_summaries.append(
-                        f"--- Client:{cid}, Model:OLS_Auto_Market ---\n{str(ols_auto.summary())}\n"
-                    )
-                except Exception:
-                    pass
+            ols_auto = sm.OLS(y_tr_log, Xtr_mat).fit()
+            raw_val = ols_auto.predict(Xval_mat)
+            model_preds_val['OLS_Auto_Market'] = safe_expm1(raw_val)
+            model_meta['OLS_Auto_Market'] = {'model': ols_auto, 'features': selected_feats}
+
+            try:
+                all_model_summaries.append(
+                    f"--- Client:{cid}, Model:OLS_Auto_Market ---\n{str(ols_auto.summary())}\n"
+                )
+            except Exception:
+                pass
         except Exception as e:
             logger.warning(f"{cid}: OLS_Auto_Market failed: {e}")
 
@@ -355,9 +414,14 @@ try:
         hist = deque(ts.tolist(), maxlen=60)
         drv_hist = deque(client_df['TotalOrders'].dropna().tolist(), maxlen=60)
 
-        market_hist_df = client_df[MARKET_VARS].dropna(axis=1, how='all')[MARKET_VARS] if MARKET_VARS else pd.DataFrame()
-        last_known_market = (market_hist_df.iloc[-1].to_dict() if not market_hist_df.empty else {})
+        # last known market values (per-column) and trend
+        mk_df = client_df[MARKET_VARS].copy()
+        if not mk_df.empty:
+            last_known_market = {mv: float(mk_df[mv].dropna().iloc[-1]) for mv in MARKET_VARS if mv in mk_df.columns and mk_df[mv].notna().any()}
+        else:
+            last_known_market = {}
         last_trend = float(client_df['trend'].iloc[-1]) if 'trend' in client_df.columns else float(len(client_df)-1)
+
         driver_fx_lookup = ({pd.Timestamp(d): float(v) for d, v in drv_fx_df[['date','TotalOrders_fx']].values}
                             if not drv_fx_df.empty else {})
 
@@ -386,15 +450,15 @@ try:
                 row['trend']       = float(last_trend + i)
                 for mv in MARKET_VARS:
                     if mv in df.columns:
-                        row[mv] = float(last_known_market.get(mv, np.nan))
+                        row[mv] = float(last_known_market.get(mv, last_known_market.get(mv, 0.0)))
 
                 if winner == 'XGBoost' and xgb_model is not None and xgb_columns is not None:
-                    x_row_full = pd.DataFrame([{c: row.get(c, np.nan) for c in xgb_columns}])
+                    x_row_full = pd.DataFrame([{c: row.get(c, 0.0) for c in xgb_columns}])  # fill missing with 0.0
                     raw = xgb_model.predict(x_row_full.values)[0]
                     pred = float(safe_expm1(raw))
                 elif winner == 'OLS_Auto_Market' and 'model' in ols_meta and 'features' in ols_meta:
                     feats = ols_meta['features']
-                    x_df = pd.DataFrame([{c: row.get(c, np.nan) for c in feats}]).astype(float)
+                    x_df = pd.DataFrame([{c: row.get(c, 0.0) for c in feats}]).astype(float)  # fill missing with 0.0
                     X_row = sm.add_constant(x_df, has_constant='add').to_numpy(dtype=float)  # pure float
                     raw = float(ols_meta['model'].predict(X_row)[0])
                     pred = float(safe_expm1(raw))
