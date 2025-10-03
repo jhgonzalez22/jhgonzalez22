@@ -510,3 +510,5 @@ try:
 
 except Exception as exc:
     email_manager.handle_error("Credit Ticket Forecasting Script Failure", exc, is_test=True)
+
+lets introduce, WeightedLagBlendDrv, WeightedLagBlend, Ridge_DriverLags, OLS_DriverLags into the competition for both client both clietns should go through all models and best one to be selected Multicollinearity -> Capping Features
