@@ -1,24 +1,24 @@
 """
-Credit Tickets - Monthly Volume Forecast — v1.17.3 (Final Hotfix++)
+Credit Tickets - Monthly Volume Forecast — v1.18 (Blend+DriverLags, Collinearity & DF Guardrails)
 
-What’s new vs v1.17.2:
-  • Target hygiene: treat `total_cases_opened` as the only target; prevent leakage
-  • OLS guardrails:
-      - Lasso pre-select → prune multicollinearity (|corr|>0.95) with priority-keep
-      - Feature cap to preserve degrees of freedom (DF)
-      - Always include seasonal anchor if present (lag_12), and force `trend` if only static market vars selected
+What’s new vs v1.17.3:
+  • New models added to the competition for BOTH clients:
+      - WeightedLagBlend         (WLBl: target-only lag blend on {3,6,12})
+      - WeightedLagBlendDrv      (WLB + seasonal driver growth blend)
+      - Ridge_DriverLags         (Ridge on driver-lag features; log-target)
+      - OLS_DriverLags           (OLS on driver-lag features; log-target with guardrails)
+  • Existing models kept:
+      - XGBoost (log target)
+      - OLS_Auto_Market (Lasso feature select + guardrails)
+      - SeasonalNaive3mGR, SeasonalNaive3mDiffGR
+  • Collinearity & DF guardrails:
+      - prune_collinearity(|corr|>0.95) with priority-keep
+      - cap max feature count (ensure residual DF ≥ ~6)
+      - always add seasonal anchor if available (lag_12); for OLS_Auto_Market, force `trend` if only static market vars selected
   • Robust inference:
       - Build BOTH target lags and driver lags during recursion (k=1..12)
-      - Use driver FX when available; hold market vars flat at last known values
-      - Pure float matrices for statsmodels to avoid dtype errors
-  • SeasonalNaive branches build driver each step and update histories safely
-
-Benchmarked models (6-month validation):
-  - XGBoost (log target)
-  - OLS_Auto_Market (Lasso feature select + guardrails)
-  - SeasonalNaive3mGR, SeasonalNaive3mDiffGR
-
-Local outputs: forecasts, audit, modeling, stats, XGB feature importances
+      - Use driver FX when available; hold market vars at last known values
+      - Endog/exog to statsmodels as pure float arrays to avoid dtype errors
 """
 
 # ------------------- standard imports -----------------------
@@ -35,7 +35,7 @@ import pandas as pd
 import statsmodels.api as sm
 from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LassoCV
+from sklearn.linear_model import LassoCV, RidgeCV
 from xgboost import XGBRegressor
 from statsmodels.tsa.stattools import adfuller
 
@@ -70,7 +70,11 @@ FX_ID_PREFIX = {
     "XGBoost": "xgb_ticket",
     "OLS_Auto_Market": "ols_auto_mkt_ticket",
     "SeasonalNaive3mGR": "seasonal_naive3mgr_ticket",
-    "SeasonalNaive3mDiffGR": "seasonal_naive3mdiffgr_ticket"
+    "SeasonalNaive3mDiffGR": "seasonal_naive3mdiffgr_ticket",
+    "WeightedLagBlend": "wlb_ticket",
+    "WeightedLagBlendDrv": "wlbdrv_ticket",
+    "Ridge_DriverLags": "ridge_drv_ticket",
+    "OLS_DriverLags": "ols_drv_ticket"
 }
 
 MARKET_VARS = ['UNRATE', 'HSN1F', 'FEDFUNDS', 'MORTGAGE30US']
@@ -90,7 +94,7 @@ def safe_expm1(x, lo=-20.0, hi=20.0):
     arr = np.asarray(x, dtype=float)
     return np.expm1(np.clip(arr, lo, hi))
 
-# includes mape() definition (fix from v1.17)
+# includes mape() definition
 def safe_reg_metrics(y_true, y_pred):
     def mape(actual, forecast):
         actual, forecast = np.asarray(actual, dtype=float), np.asarray(forecast, dtype=float)
@@ -132,19 +136,16 @@ def prune_collinearity(X_df: pd.DataFrame, keep_priority: list, thr: float = 0.9
     if X_df.shape[1] <= 1:
         return X_df.columns.tolist()
 
-    # Order columns by (1) explicit priority, then (2) remaining columns by variance (proxy for info)
     cols = X_df.columns.tolist()
     prio = [c for c in keep_priority if c in cols]
     rest = [c for c in cols if c not in prio]
-    # variance sort descending to prefer informative features
     rest_sorted = sorted(rest, key=lambda c: np.nanvar(X_df[c].values), reverse=True)
     ordered = prio + rest_sorted
 
     kept = []
-    # Precompute correlation matrix once on rows w/o NA
     Xc = X_df.dropna()
     if Xc.shape[0] < 3:
-        return ordered[: min(6, len(ordered))]  # minimal fallback
+        return ordered[: min(6, len(ordered))]
 
     corrM = Xc.corr(numeric_only=True).fillna(0.0)
 
@@ -161,6 +162,21 @@ def prune_collinearity(X_df: pd.DataFrame, keep_priority: list, thr: float = 0.9
         if ok:
             kept.append(col)
     return kept
+
+# --------- driver-growth (WeightedLagBlendDrv helper) ----------
+DRV_ALPHA_PROFILE = [0.50, 0.30, 0.20]
+def compute_driver_r_yoy_weighted(s: pd.Series, ref_months: pd.DatetimeIndex) -> float:
+    """
+    Weighted YoY growth using last 3 months vs prior-year same months with weights 0.5/0.3/0.2
+    """
+    w = DRV_ALPHA_PROFILE
+    rs = []
+    for t in ref_months:
+        num = sum(w[i] * s.get(t - pd.DateOffset(months=i+1), np.nan) for i in range(3))
+        den = sum(w[i] * s.get(t - pd.DateOffset(months=i+13), np.nan) for i in range(3))
+        if np.isfinite(num) and np.isfinite(den) and den != 0:
+            rs.append(num/den - 1.0)
+    return float(np.mean(rs)) if rs else np.nan
 
 # ------------------- data fetching -------------------------
 def fetch_market_data(bq: BigQueryManager) -> pd.DataFrame:
@@ -209,7 +225,7 @@ def fetch_credit_driver_forecasts(bq: BigQueryManager) -> pd.DataFrame:
 
 # ------------------- MAIN EXECUTION -------------------------
 try:
-    logger.info("Starting Credit Ticket Forecasting Script (v1.17.3)...")
+    logger.info("Starting Credit Ticket Forecasting Script (v1.18)...")
 
     # Base tickets (monthly)
     TICKET_QUERY = """
@@ -265,12 +281,12 @@ try:
 
         ts = client_df.set_index('date')['total_cases_opened'].asfreq('MS')
 
-        # Build modeling table (NOTE: exclude total_cases_opened from features to avoid leakage)
+        # Build modeling table (exclude target from features to avoid leakage)
         feat_all = pd.DataFrame({'y': ts}).join(
             client_df.set_index('date').drop(columns=['total_cases_opened'], errors='ignore')
         )
 
-        # Clean to numeric + drop any NA rows
+        # Clean to numeric + drop any NA rows (forces all 12 lags available)
         cols_to_clean = [c for c in feat_all.columns if c not in ['client_id', 'vol_type', 'date']]
         for col in cols_to_clean:
             feat_all[col] = pd.to_numeric(feat_all[col], errors='coerce')
@@ -294,7 +310,7 @@ try:
 
         model_preds_val, model_meta = {}, {}
 
-        # 1) XGBoost (log target)
+        # ---------------- 1) XGBoost (log target) ----------------
         try:
             xgb = XGBRegressor(
                 objective="reg:squarederror",
@@ -310,38 +326,31 @@ try:
         except Exception as e:
             logger.warning(f"{cid}: XGBoost failed: {e}")
 
-        # 2) OLS_Auto_Market (Lasso selection -> prune -> cap -> OLS refit) with guardrails
+        # ---------------- 2) OLS_Auto_Market (Lasso → prune → cap → OLS) ----------------
         try:
-            # Scale for Lasso (selection only)
             scaler = StandardScaler(with_mean=True, with_std=True).fit(X_tr.values)
             X_tr_scaled = scaler.transform(X_tr.values)
 
-            # Cross-validated Lasso to pick a compact set
             lasso = LassoCV(cv=min(3, max(2, len(train_df)//4)),
                             random_state=42, n_alphas=100).fit(X_tr_scaled, y_tr_log)
             sel_idx = np.where(np.abs(lasso.coef_) > 1e-8)[0].tolist()
             selected_feats = [candidate_cols[i] for i in sel_idx]
 
-            # Guardrail: if only market vars selected, force 'trend'
             only_market = (len(selected_feats) > 0) and all(f in MARKET_VARS for f in selected_feats)
             if only_market and 'trend' in candidate_cols and 'trend' not in selected_feats:
                 logger.info(f"{cid}: Only market vars selected — forcing 'trend' into OLS.")
                 selected_feats.append('trend')
 
-            # If Lasso selected nothing, fallback to strong seasonal/lag signal
             if not selected_feats:
-                fallback = [c for c in ['lag_12', 'lag_1', 'lag_2', 'lag_3', 'TotalOrders', 'drv_lag_1', 'trend', 'month'] if c in candidate_cols]
+                fallback = [c for c in ['lag_12','lag_1','lag_2','lag_3','TotalOrders','drv_lag_1','trend','month'] if c in candidate_cols]
                 selected_feats = fallback[:4] if fallback else candidate_cols[:3]
 
-            # Prune multicollinearity with priority-keep
-            keep_priority = [c for c in ['lag_12', 'lag_1', 'lag_2', 'lag_3', 'TotalOrders', 'drv_lag_1', 'trend', 'month'] if c in candidate_cols]
+            keep_priority = [c for c in ['lag_12','lag_1','lag_2','lag_3','TotalOrders','drv_lag_1','trend','month'] if c in candidate_cols]
             pruned = prune_collinearity(train_df[selected_feats].astype(float), keep_priority, thr=0.95)
 
-            # Cap features to preserve DF: df_resid >= 5
             n_obs = len(train_df)
-            max_feats = max(1, min(6, n_obs - 6))  # aim for at least ~6 residual DF
+            max_feats = max(1, min(6, n_obs - 6))
             if len(pruned) > max_feats:
-                # Rank remaining by absolute correlation with y (log-space target for consistency)
                 ytmp = y_tr_log
                 feat_scores = []
                 for c in pruned:
@@ -350,11 +359,8 @@ try:
                     feat_scores.append((c, abs(float(cor)) if np.isfinite(cor) else 0.0))
                 pruned = [c for c, _ in sorted(feat_scores, key=lambda t: t[1], reverse=True)[:max_feats]]
 
-            # Make sure seasonal anchor is present if available
             if 'lag_12' in candidate_cols and 'lag_12' not in pruned:
-                # If adding it would exceed max, replace the weakest
                 if len(pruned) >= max_feats:
-                    # drop weakest by abs corr
                     ytmp = y_tr_log
                     corrs = [(c, abs(np.corrcoef(ytmp, train_df[c].values)[0,1]) if np.isfinite(train_df[c].values).sum()>=3 else 0.0) for c in pruned]
                     weakest = sorted(corrs, key=lambda t: t[1])[0][0] if corrs else pruned[-1]
@@ -363,7 +369,6 @@ try:
 
             selected_feats = pruned
 
-            # Refit OLS on selected_feats (pure float arrays)
             Xtr_sel_df = train_df[selected_feats].astype(float)
             Xval_sel_df = val_df[selected_feats].astype(float)
 
@@ -384,7 +389,115 @@ try:
         except Exception as e:
             logger.warning(f"{cid}: OLS_Auto_Market failed: {e}")
 
-        # 3) SeasonalNaive3mGR & 4) SeasonalNaive3mDiffGR
+        # ---------------- 3) WeightedLagBlend (target lags 3,6,12) ----------------
+        try:
+            lags = {l: feat_all[f'lag_{l}'].reindex(val_df.index) for l in [3,6,12] if f'lag_{l}' in feat_all.columns}
+            if set([3,6,12]).issubset(lags.keys()):
+                mask = pd.concat(lags.values(), axis=1).notna().all(axis=1)
+                best_w, best_s = (1.0,0.0,0.0), np.inf
+                if mask.any():
+                    yv = val_df['y'][mask].values
+                    l3, l6, l12 = lags[3][mask].values, lags[6][mask].values, lags[12][mask].values
+                    for w1 in np.arange(0, 1.05, 0.05):
+                        for w2 in np.arange(0, 1.05-w1, 0.05):
+                            w3 = 1 - w1 - w2
+                            pred = w1*l3 + w2*l6 + w3*l12
+                            s = smape(yv, pred)
+                            if s < best_s:
+                                best_s, best_w = s, (w1,w2,w3)
+                wl_pred = best_w[0]*lags[3].fillna(0) + best_w[1]*lags[6].fillna(0) + best_w[2]*lags[12].fillna(0)
+                model_preds_val['WeightedLagBlend'] = wl_pred.values
+                model_meta['WeightedLagBlend'] = {'weights': {'w_lag3':best_w[0],'w_lag6':best_w[1],'w_lag12':best_w[2]}}
+        except Exception as e:
+            logger.warning(f"{cid}: WeightedLagBlend failed: {e}")
+
+        # ---------------- 4) WeightedLagBlendDrv (blend WLB with driver seasonal) ----------------
+        try:
+            # Compute driver YoY-weighted growth at anchor (last available date in train)
+            drv_series = client_df.set_index('date')['TotalOrders'].asfreq('MS')
+            anchor = ts.index[-1]  # end of history
+            r_drv = compute_driver_r_yoy_weighted(drv_series, pd.DatetimeIndex([anchor]))
+            if 'WeightedLagBlend' in model_preds_val and np.isfinite(r_drv):
+                # seasonal driver naive for val months: y(t-12) * (1 + r_drv)
+                sdrv = [ts.get(d - pd.DateOffset(months=12), np.nan) * (1.0 + r_drv) for d in val_df.index]
+                sdrv = pd.Series(sdrv, index=val_df.index).fillna(0.0)
+                wlb = pd.Series(model_preds_val['WeightedLagBlend'], index=val_df.index).fillna(0.0)
+
+                best_lam, best_s = 0.5, np.inf
+                for lam in np.arange(0.5, 0.96, 0.05):
+                    p_try = lam*wlb + (1.0-lam)*sdrv
+                    s = smape(val_df['y'].values, p_try.values)
+                    if s < best_s:
+                        best_s, best_lam = s, lam
+                model_preds_val['WeightedLagBlendDrv'] = (best_lam*wlb + (1.0-best_lam)*sdrv).values
+                model_meta['WeightedLagBlendDrv'] = {'lambda': float(best_lam), 'r_drv': float(r_drv)}
+        except Exception as e:
+            logger.warning(f"{cid}: WeightedLagBlendDrv failed: {e}")
+
+        # ---------------- 5) Ridge_DriverLags (log-target) ----------------
+        try:
+            drv_feats = [f'drv_lag_{k}' for k in range(1, MAX_LAGS+1) if f'drv_lag_{k}' in candidate_cols]
+            add_feats = [c for c in ['TotalOrders','trend','month'] if c in candidate_cols]
+            ridge_feats = drv_feats + add_feats
+            if ridge_feats:
+                Xtr_r = train_df[ridge_feats].astype(float).values
+                Xval_r = val_df[ridge_feats].astype(float).values
+                scaler_r = StandardScaler(with_mean=True, with_std=True).fit(Xtr_r)
+                Xtr_rs, Xval_rs = scaler_r.transform(Xtr_r), scaler_r.transform(Xval_r)
+
+                ridge = RidgeCV(alphas=np.logspace(-3, 3, 25), cv=min(3, max(2, len(train_df)//4))).fit(Xtr_rs, y_tr_log)
+                pred_val = safe_expm1(ridge.predict(Xval_rs))
+                model_preds_val['Ridge_DriverLags'] = pred_val
+                model_meta['Ridge_DriverLags'] = {'model': ridge, 'scaler': scaler_r, 'features': ridge_feats}
+        except Exception as e:
+            logger.warning(f"{cid}: Ridge_DriverLags failed: {e}")
+
+        # ---------------- 6) OLS_DriverLags (log-target, prune+cap) ----------------
+        try:
+            drv_feats = [f'drv_lag_{k}' for k in range(1, MAX_LAGS+1) if f'drv_lag_{k}' in candidate_cols]
+            add_feats = [c for c in ['TotalOrders','trend','month'] if c in candidate_cols]
+            ols_drv_feats = drv_feats + add_feats
+            if ols_drv_feats:
+                # prune and cap
+                keep_priority = [c for c in ['drv_lag_12','drv_lag_6','drv_lag_3','drv_lag_1','TotalOrders','trend','month'] if c in ols_drv_feats]
+                pruned = prune_collinearity(train_df[ols_drv_feats].astype(float), keep_priority, thr=0.95)
+                n_obs = len(train_df)
+                max_feats = max(1, min(6, n_obs - 6))
+                if len(pruned) > max_feats:
+                    ytmp = y_tr_log
+                    feat_scores = []
+                    for c in pruned:
+                        xv = train_df[c].values
+                        cor = np.corrcoef(ytmp, xv)[0,1] if np.isfinite(xv).sum() >= 3 else 0.0
+                        feat_scores.append((c, abs(float(cor)) if np.isfinite(cor) else 0.0))
+                    pruned = [c for c, _ in sorted(feat_scores, key=lambda t: t[1], reverse=True)[:max_feats]]
+                if 'drv_lag_12' in ols_drv_feats and 'drv_lag_12' not in pruned:
+                    if len(pruned) >= max_feats:
+                        ytmp = y_tr_log
+                        corrs = [(c, abs(np.corrcoef(ytmp, train_df[c].values)[0,1]) if np.isfinite(train_df[c].values).sum()>=3 else 0.0) for c in pruned]
+                        weakest = sorted(corrs, key=lambda t: t[1])[0][0] if corrs else pruned[-1]
+                        pruned = [c for c in pruned if c != weakest]
+                    pruned.append('drv_lag_12')
+
+                Xtr_sel_df = train_df[pruned].astype(float)
+                Xval_sel_df = val_df[pruned].astype(float)
+                Xtr_mat = sm.add_constant(Xtr_sel_df, has_constant='add').to_numpy(dtype=float)
+                Xval_mat = sm.add_constant(Xval_sel_df, has_constant='add').to_numpy(dtype=float)
+                ols_drv = sm.OLS(y_tr_log, Xtr_mat).fit()
+                raw_val = ols_drv.predict(Xval_mat)
+                model_preds_val['OLS_DriverLags'] = safe_expm1(raw_val)
+                model_meta['OLS_DriverLags'] = {'model': ols_drv, 'features': pruned}
+
+                try:
+                    all_model_summaries.append(
+                        f"--- Client:{cid}, Model:OLS_DriverLags ---\n{str(ols_drv.summary())}\n"
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"{cid}: OLS_DriverLags failed: {e}")
+
+        # ---------------- 7) SeasonalNaive models ----------------
         try:
             snaive_gr, snaive_diff = [], []
             full_ts_for_pos = df[df['client_id'] == cid].set_index('date')['total_cases_opened'].asfreq('MS')
@@ -400,21 +513,27 @@ try:
         except Exception as e:
             logger.warning(f"{cid}: SeasonalNaive models failed: {e}")
 
-        # Winner by 6m SMAPE
+        # -------- Winner by 6m SMAPE --------
         if not model_preds_val:
             logger.warning(f"{cid}: No models produced validation predictions; skipping.")
             continue
         scores = {name: safe_reg_metrics(val_df['y'].values, pred)['smape'] for name, pred in model_preds_val.items()}
         winner = min(scores, key=scores.get)
         logger.info(f"✓ WINNER for {cid}: {winner} (SMAPE: {scores[winner]:.2f})")
-        for name in model_preds_val:
-            audit_rows.append({'client_id': cid, 'model': name, 'winner_model': winner, 'val_smape_6m': float(scores.get(name, np.nan))})
+        for name, pred in model_preds_val.items():
+            row = {'client_id': cid, 'model': name, 'winner_model': winner, 'val_smape_6m': float(scores.get(name, np.nan))}
+            # add hyperparams if present
+            if name == 'WeightedLagBlend':
+                row.update(model_meta['WeightedLagBlend']['weights'])
+            if name == 'WeightedLagBlendDrv':
+                row['lambda'] = model_meta['WeightedLagBlendDrv']['lambda']
+                row['r_drv']  = model_meta['WeightedLagBlendDrv']['r_drv']
+            audit_rows.append(row)
 
-        # ---------------- Recursive Forecast (15 months) ----------------
+        # ------------- Recursive Forecast (15 months) -------------
         hist = deque(ts.tolist(), maxlen=60)
         drv_hist = deque(client_df['TotalOrders'].dropna().tolist(), maxlen=60)
 
-        # last known market values (per-column) and trend
         mk_df = client_df[MARKET_VARS].copy()
         if not mk_df.empty:
             last_known_market = {mv: float(mk_df[mv].dropna().iloc[-1]) for mv in MARKET_VARS if mv in mk_df.columns and mk_df[mv].notna().any()}
@@ -429,16 +548,25 @@ try:
 
         xgb_model   = model_meta.get('XGBoost', {}).get('model')
         xgb_columns = model_meta.get('XGBoost', {}).get('columns')
-        ols_meta    = model_meta.get('OLS_Auto_Market', {})
+        ols_auto    = model_meta.get('OLS_Auto_Market', {}).get('model')
+        ols_auto_feats = model_meta.get('OLS_Auto_Market', {}).get('features', [])
+        ridge_meta  = model_meta.get('Ridge_DriverLags', {})
+        ols_drv_meta= model_meta.get('OLS_DriverLags', {})
+        wlb_meta    = model_meta.get('WeightedLagBlend', {})
+        wlbdrv_meta = model_meta.get('WeightedLagBlendDrv', {})
+
+        # Precompute driver growth for recursion if needed
+        drv_series = client_df.set_index('date')['TotalOrders'].asfreq('MS')
+        r_drv_anchor = compute_driver_r_yoy_weighted(drv_series, pd.DatetimeIndex([ts.index[-1]]))
 
         for i, d in enumerate(future_idx, 1):
-            # Driver for this month (available for ALL branches)
+            # Driver for this month
             last_driver = (drv_hist[-1] if len(drv_hist) else 0.0)
             current_total_orders = driver_fx_lookup.get(d, last_driver)
 
             pred = np.nan
 
-            if winner in ['XGBoost', 'OLS_Auto_Market']:
+            if winner in ['XGBoost', 'OLS_Auto_Market', 'Ridge_DriverLags', 'OLS_DriverLags']:
                 # Build feature row with BOTH target lags and driver lags
                 row = {}
                 for k in range(1, MAX_LAGS + 1):
@@ -450,18 +578,55 @@ try:
                 row['trend']       = float(last_trend + i)
                 for mv in MARKET_VARS:
                     if mv in df.columns:
-                        row[mv] = float(last_known_market.get(mv, last_known_market.get(mv, 0.0)))
+                        row[mv] = float(last_known_market.get(mv, 0.0))
 
                 if winner == 'XGBoost' and xgb_model is not None and xgb_columns is not None:
-                    x_row_full = pd.DataFrame([{c: row.get(c, 0.0) for c in xgb_columns}])  # fill missing with 0.0
+                    x_row_full = pd.DataFrame([{c: row.get(c, 0.0) for c in xgb_columns}])
                     raw = xgb_model.predict(x_row_full.values)[0]
                     pred = float(safe_expm1(raw))
-                elif winner == 'OLS_Auto_Market' and 'model' in ols_meta and 'features' in ols_meta:
-                    feats = ols_meta['features']
-                    x_df = pd.DataFrame([{c: row.get(c, 0.0) for c in feats}]).astype(float)  # fill missing with 0.0
-                    X_row = sm.add_constant(x_df, has_constant='add').to_numpy(dtype=float)  # pure float
-                    raw = float(ols_meta['model'].predict(X_row)[0])
+
+                elif winner == 'OLS_Auto_Market' and ols_auto is not None:
+                    x_df = pd.DataFrame([{c: row.get(c, 0.0) for c in ols_auto_feats}]).astype(float)
+                    X_row = sm.add_constant(x_df, has_constant='add').to_numpy(dtype=float)
+                    raw = float(ols_auto.predict(X_row)[0])
                     pred = float(safe_expm1(raw))
+
+                elif winner == 'Ridge_DriverLags' and ridge_meta:
+                    feats = ridge_meta['features']
+                    scaler_r = ridge_meta['scaler']
+                    ridge = ridge_meta['model']
+                    x_r = pd.DataFrame([{c: row.get(c, 0.0) for c in feats}]).astype(float).values
+                    x_r_s = scaler_r.transform(x_r)
+                    raw = float(ridge.predict(x_r_s)[0])
+                    pred = float(safe_expm1(raw))
+
+                elif winner == 'OLS_DriverLags' and ols_drv_meta:
+                    feats = ols_drv_meta['features']
+                    x_df = pd.DataFrame([{c: row.get(c, 0.0) for c in feats}]).astype(float)
+                    X_row = sm.add_constant(x_df, has_constant='add').to_numpy(dtype=float)
+                    raw = float(ols_drv_meta['model'].predict(X_row)[0])
+                    pred = float(safe_expm1(raw))
+
+            elif winner == 'WeightedLagBlend' and wlb_meta:
+                w = wlb_meta['weights']
+                y3  = hist[-3]  if len(hist)>=3  else (hist[-1] if len(hist) else 0.0)
+                y6  = hist[-6]  if len(hist)>=6  else (hist[-1] if len(hist) else 0.0)
+                y12 = hist[-12] if len(hist)>=12 else (hist[-1] if len(hist) else 0.0)
+                pred = float(w['w_lag3']*y3 + w['w_lag6']*y6 + w['w_lag12']*y12)
+
+            elif winner == 'WeightedLagBlendDrv' and wlbdrv_meta and wlb_meta:
+                w = wlb_meta['weights']
+                y3  = hist[-3]  if len(hist)>=3  else (hist[-1] if len(hist) else 0.0)
+                y6  = hist[-6]  if len(hist)>=6  else (hist[-1] if len(hist) else 0.0)
+                y12 = hist[-12] if len(hist)>=12 else (hist[-1] if len(hist) else 0.0)
+                wlb = w['w_lag3']*y3 + w['w_lag6']*y6 + w['w_lag12']*y12
+
+                base = hist[-12] if len(hist) >= 12 else (hist[-1] if len(hist) else 0.0)
+                rdrv = r_drv_anchor if np.isfinite(r_drv_anchor) else 0.0
+                sdrv = base * (1.0 + rdrv)
+
+                lam = float(wlbdrv_meta.get('lambda', 0.8))
+                pred = float(lam*wlb + (1.0 - lam)*sdrv)
 
             else:  # SeasonalNaive* winners
                 base = hist[-12] if len(hist) >= 12 else (hist[-1] if len(hist) else 0.0)
@@ -476,7 +641,7 @@ try:
 
             # update histories for next step
             hist.append(pred)
-            drv_hist.append(current_total_orders)  # ALWAYS push the driver, regardless of winner
+            drv_hist.append(current_total_orders)  # ALWAYS push the driver
 
             forecasts.append({
                 'fx_date': d,
@@ -510,5 +675,3 @@ try:
 
 except Exception as exc:
     email_manager.handle_error("Credit Ticket Forecasting Script Failure", exc, is_test=True)
-
-lets introduce, WeightedLagBlendDrv, WeightedLagBlend, Ridge_DriverLags, OLS_DriverLags into the competition for both client both clietns should go through all models and best one to be selected Multicollinearity -> Capping Features
