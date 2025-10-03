@@ -1,0 +1,9 @@
+client_id,model,winner_model,val_smape_6m
+Credit - Customer Support,XGBoost,OLS_Auto_Market,17.995853789898838
+Credit - Customer Support,OLS_Auto_Market,OLS_Auto_Market,10.76500848964507
+Credit - Customer Support,SeasonalNaive3mGR,OLS_Auto_Market,32.53444516034886
+Credit - Customer Support,SeasonalNaive3mDiffGR,OLS_Auto_Market,25.90762151874923
+Credit - Tech Support,XGBoost,OLS_Auto_Market,3.9348532168324977
+Credit - Tech Support,OLS_Auto_Market,OLS_Auto_Market,2.5766838095968048
+Credit - Tech Support,SeasonalNaive3mGR,OLS_Auto_Market,22.620543298386984
+Credit - Tech Support,SeasonalNaive3mDiffGR,OLS_Auto_Market,20.77582884120648
