@@ -1,18 +1,17 @@
 """
-CX Credit - Call Volume Forecast - Production Hybrid v2.8
+CX Credit - Call Volume Forecast - Production Hybrid v2.9
 
 - vol_type strictly 'phone' or 'chat'
 - PHONE: CWLB vs XGB vs Native3mGR; winner by 6m SMAPE; recursive forecast
+         XGB enhanced with lag_1 and lag_2 to capture short-term volatility.
 - CHAT : WLB with lags {1,3} only; weights learned on LAST 3 MONTHS (3m SMAPE);
          recursive forecast using those fixed weights
-- GBQ push: enforces one row per (client_id, vol_type, fx_date) in this run,
-            and deactivates older rows across legacy vol_type suffixes
-            (e.g., phone_cwlb, chat_xgboost) for same BU+month+channel.
+- GBQ push: enforces one row per (client_id, vol_type, fx_date) and deactivates older rows.
 
 Hardening:
  - Numeric coercion/guards for stats & SMAPE
  - Safe JSON serialization (NumPy -> Python native)
- - Robust GBQ dedup using base channel via REGEXP_EXTRACT
+ - Robust GBQ dedup (covers legacy vol_type suffixes)
 """
 
 # ------------------- standard imports -----------------------
@@ -114,23 +113,29 @@ def find_best_weights(ts: pd.Series, lags: list, constraints: dict, val_window_l
         valid = True
         for lag, limits in constraints.items():
             if isinstance(lag, int) and lag in weights:
-                if 'max' in limits and weights[lag] > limits['max'] + 1e-9: valid = False; break
-                if 'min' in limits and weights[lag] < limits['min'] - 1e-9: valid = False; break
-        if not valid: continue
+                if 'max' in limits and weights[lag] > limits['max'] + 1e-9:
+                    valid = False; break
+                if 'min' in limits and weights[lag] < limits['min'] - 1e-9:
+                    valid = False; break
+        if not valid:
+            continue
 
         # Combined constraints (optional)
         if 'combined' in constraints:
             for combo in constraints['combined']:
                 combo_sum = sum(weights.get(l, 0.0) for l in combo['lags'])
-                if 'min' in combo and combo_sum < combo['min'] - 1e-9: valid = False; break
-            if not valid: continue
+                if 'min' in combo and combo_sum < combo['min'] - 1e-9:
+                    valid = False; break
+            if not valid:
+                continue
 
         forecast_vals = 0.0
         for lag, w in weights.items():
             forecast_vals += ts.shift(lag).reindex(validation_data.index) * w
 
         mask = forecast_vals.notna() & validation_data.notna()
-        if not mask.any(): continue
+        if not mask.any():
+            continue
 
         current_smape = smape(validation_data[mask], forecast_vals[mask])
         if current_smape < best_smape - 0.1:
@@ -195,7 +200,7 @@ def seasonal_naive_3m_gr_predict(train_series: pd.Series, pred_index: pd.Datetim
 
 # ------------------- MAIN EXECUTION -------------------------
 try:
-    logger.info("Starting Credit Forecasting v2.8 (Phone + Chat)...")
+    logger.info("Starting Credit Forecasting v2.9 (Phone + Chat)...")
 
     # 1) Fetch & Prepare Data
     source_df = bigquery_manager.run_gbq_sql(SQL_QUERY_PATH, return_dataframe=True)
@@ -253,8 +258,8 @@ try:
         bu_ts = bu['TotalCallsOffered'].asfreq('MS')
         all_modeling_data.append(bu.copy())
 
-        # XGB features (Phone)
-        xgb_feats = ['trend','sin_month','cos_month','lag_3','lag_6','lag_12'] + \
+        # XGB features (Phone) — now includes lag_1 and lag_2 to capture volatility
+        xgb_feats = ['trend','sin_month','cos_month','lag_1','lag_2','lag_3','lag_6','lag_12'] + \
                     [c for c in [f'{x}_lag_{l}' for x in ECONOMIC_FEATURES for l in [3,6,12]] if c in bu.columns]
 
         stat_test_results.append(perform_statistical_tests(bu, f"Phone:{bu_name}", xgb_feats))
@@ -271,10 +276,18 @@ try:
         )
         logger.info(f"  -> CWLB SMAPE={f'{cwlb_smape:.2f}' if np.isfinite(cwlb_smape) else 'N/A'}")
 
-        # XGB
+        # XGB (tuned slightly to allow richer patterns)
         Xtr, Xv = train[xgb_feats], valid[xgb_feats]
         ytr = train['TotalCallsOffered']
-        xgb = XGBRegressor(objective="reg:squarederror", n_estimators=100, learning_rate=0.05, max_depth=3, random_state=42)
+        xgb = XGBRegressor(
+            objective="reg:squarederror",
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=4,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            random_state=42
+        )
         xgb.fit(Xtr, np.log1p(ytr))
         xgb_preds = safe_expm1(xgb.predict(Xv))
         xgb_smape = smape(y_val, xgb_preds)
@@ -326,18 +339,27 @@ try:
                             w = long_weights;  Ls = sorted(long_weights.keys())
                         lags_to_use = {L: hist[-L] for L in Ls if len(hist) >= L}
                         pred = sum(w.get(L, 0.0) * lags_to_use[L] for L in lags_to_use)
+
                 elif winner == 'XGBoost':
-                    row = {'trend': (train['trend'].max() or 0) + len(valid) + i,
-                           'sin_month': np.sin(2*np.pi*d.month/12), 'cos_month': np.cos(2*np.pi*d.month/12),
-                           'lag_3': hist[-3] if len(hist) >= 3 else hist[-1],
-                           'lag_6': hist[-6] if len(hist) >= 6 else hist[-1],
-                           'lag_12': hist[-12] if len(hist) >= 12 else hist[-1]}
+                    # Build future row with short-term lags to carry volatility
+                    row = {
+                        'trend': (train['trend'].max() or 0) + len(valid) + i,
+                        'sin_month': np.sin(2*np.pi*d.month/12),
+                        'cos_month': np.cos(2*np.pi*d.month/12),
+                        'lag_1':  hist[-1] if len(hist) >= 1 else np.nan,
+                        'lag_2':  hist[-2] if len(hist) >= 2 else (hist[-1] if len(hist) else np.nan),
+                        'lag_3':  hist[-3] if len(hist) >= 3 else (hist[-1] if len(hist) else np.nan),
+                        'lag_6':  hist[-6] if len(hist) >= 6 else (hist[-1] if len(hist) else np.nan),
+                        'lag_12': hist[-12] if len(hist) >= 12 else (hist[-1] if len(hist) else np.nan),
+                    }
                     for c in ECONOMIC_FEATURES:
                         for l in [3,6,12]:
                             key = f'{c}_lag_{l}'
                             if key in xgb_feats:
+                                # reuse last known lagged econ value
                                 row[key] = bu[key].dropna().iloc[-1] if key in bu.columns and not bu[key].dropna().empty else np.nan
                     pred = safe_expm1(xgb.predict(pd.DataFrame([row])[xgb_feats])[0])
+
                 else:  # Native3mGR
                     t12 = hist[-12] if len(hist) >= 12 else hist[-1]
                     factor = native_factor if (native_factor is not None and np.isfinite(native_factor)) else 1.0
@@ -457,7 +479,6 @@ try:
                 FROM `{DEST_TABLE}` s
                 WHERE s.client_id = t.client_id
                   AND s.fx_date = t.fx_date
-                  -- same channel (phone/chat) regardless of historical suffixes
                   AND REGEXP_EXTRACT(s.vol_type, r'^(phone|chat)') = REGEXP_EXTRACT(t.vol_type, r'^(phone|chat)')
                   AND s.load_ts > t.load_ts
               )
