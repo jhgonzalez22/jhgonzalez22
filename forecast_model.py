@@ -441,3 +441,25 @@ try:
 
 except Exception as exc:
     email_manager.handle_error("Credit Phone Production Script Failure", exc, is_test=True)
+
+venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_299_File.py
+Traceback (most recent call last):
+  File "c:\WFM_Scripting\Forecasting\Rpt_299_File.py", line 443, in <module>
+    email_manager.handle_error("Credit Phone Production Script Failure", exc, is_test=True)
+  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1319, in handle_error
+    raise exception
+  File "c:\WFM_Scripting\Forecasting\Rpt_299_File.py", line 299, in <module>
+    xgb_imp_rows.append({'bu': bu_name, 'feature_importance': json.dumps(imp)})
+                                                              ^^^^^^^^^^^^^^^
+  File "C:\Users\jhgonzalez\AppData\Local\Programs\Python\Python311\Lib\json\__init__.py", line 231, in dumps
+    return _default_encoder.encode(obj)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\jhgonzalez\AppData\Local\Programs\Python\Python311\Lib\json\encoder.py", line 200, in encode
+    chunks = self.iterencode(o, _one_shot=True)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\jhgonzalez\AppData\Local\Programs\Python\Python311\Lib\json\encoder.py", line 258, in iterencode
+    return _iterencode(o, 0)
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\jhgonzalez\AppData\Local\Programs\Python\Python311\Lib\json\encoder.py", line 180, in default
+    raise TypeError(f'Object of type {o.__class__.__name__} '
+TypeError: Object of type float32 is not JSON serializable
