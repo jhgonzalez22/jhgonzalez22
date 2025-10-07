@@ -494,3 +494,14 @@ try:
 
 except Exception as exc:
     email_manager.handle_error("Credit Forecast Script Failure", exc, is_test=True)
+
+(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_299_File.py
+Traceback (most recent call last):
+  File "c:\WFM_Scripting\Forecasting\Rpt_299_File.py", line 496, in <module>
+    email_manager.handle_error("Credit Forecast Script Failure", exc, is_test=True)
+  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1319, in handle_error
+    raise exception
+  File "c:\WFM_Scripting\Forecasting\Rpt_299_File.py", line 466, in <module>
+    date_min = fx_df['fx_date'].min().date()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'datetime.date' object has no attribute 'date'
