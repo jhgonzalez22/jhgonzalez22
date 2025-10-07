@@ -1,5 +1,5 @@
 """
-CX Credit - Call Volume Forecast - Production Hybrid v3.16 (Final Corrected)
+CX Credit - Call Volume Forecast - Production Hybrid v3.16.1 (Final Corrected++)
 
 WHAT THIS SCRIPT DOES
 ---------------------
@@ -69,199 +69,318 @@ CORRELATION_ANALYSIS_CSV   = r"C:\WFM_Scripting\correlation_analysis_credit.csv"
 MODEL_SUMMARIES_FILE       = r"C:\WFM_Scripting\model_summaries_credit.txt"
 
 # ------------------- forecast parameters --------------------
-FORECAST_HORIZON   = 12  # We will forecast 12 months into the future.
-VAL_LEN_PHONE_6M   = 6   # Use the last 6 months of data to test Phone models.
-VAL_LEN_CHAT_3M    = 3   # Use the last 3 months of data to learn Chat model weights.
-STAMP              = datetime.now(pytz.timezone("America/Chicago")) # Timestamp for this run.
-GRID_STEP          = 0.05  # Granularity for the WBL weight search (e.g., 0.05 = steps of 5%).
+FORECAST_HORIZON   = 12  # Forecast 12 months into the future.
+VAL_LEN_PHONE_6M   = 6   # Phone: 6 months validation.
+VAL_LEN_CHAT_3M    = 3   # Chat: 3 months validation.
+STAMP              = datetime.now(pytz.timezone("America/Chicago"))  # Run timestamp.
+GRID_STEP          = 0.05  # Grid step for WBL weight search (e.g., 0.05 = 5%).
 
 # ------------------- utilities -------------------------
 def to_native(obj):
-    """Converts NumPy data types to native Python types for clean JSON serialization."""
+    """Convert NumPy types to native Python for clean JSON serialization."""
     if isinstance(obj, dict): return {to_native(k): to_native(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)): return [to_native(x) for x in obj]
     if isinstance(obj, (np.floating, np.integer)): return obj.item()
     return obj
 
 def smape(actual, forecast):
-    """Calculates Symmetric Mean Absolute Percentage Error, a robust accuracy metric."""
+    """Symmetric Mean Absolute Percentage Error."""
     actual, forecast = np.asarray(actual, dtype=float), np.asarray(forecast, dtype=float)
     denom = (np.abs(actual) + np.abs(forecast)) / 2.0
-    denom[denom == 0] = 1.0 # Avoid division by zero
+    denom[denom == 0] = 1.0  # Avoid div-by-zero
     return np.mean(np.abs(actual - forecast) / denom) * 100
 
 def safe_round(x):
-    """Safely rounds a number to the nearest non-negative integer."""
-    return int(max(0, round(x or 0)))
+    """Round to nearest non-negative int."""
+    try:
+        return int(max(0, round(float(x) if x is not None and np.isfinite(x) else 0.0)))
+    except Exception:
+        return 0
 
 def find_best_weights(ts: pd.Series, lags: list, val_window_len: int, step: float):
     """
-    Finds the optimal set of weights for a Weighted Lag Blend (WBL) model.
-    It performs a grid search to find the weight combination that minimizes SMAPE.
+    Grid search optimal WBL weights to minimize SMAPE on the last `val_window_len`.
+    ts: pandas Series indexed by monthly period; values are target volumes.
     """
-    if not lags or len(ts) < val_window_len + max(lags): return None, np.inf
+    if not lags or len(ts) < val_window_len + max(lags):
+        return None, np.inf
+
     validation_data = ts.iloc[-val_window_len:]
     best_weights, best_smape = None, np.inf
-    
+
+    # Generate weights for (k-1) lags and set last to 1 - sum(others)
     weight_iters = [np.arange(0, 1.0 + step, step) for _ in range(len(lags) - 1)] if len(lags) > 1 else [[1.0]]
+
     for W in itertools.product(*weight_iters):
-        if sum(W) > 1.0 + 1e-9: continue
+        if sum(W) > 1.0 + 1e-9:
+            continue
         all_w = list(W) if len(lags) == 1 else list(W) + [1.0 - sum(W)]
         weights = {int(l): float(w) for l, w in zip(lags, all_w)}
-        
+
+        # Build validation forecast
         forecast_vals = sum(ts.shift(lag).reindex(validation_data.index) * w for lag, w in weights.items())
         mask = forecast_vals.notna() & validation_data.notna()
-        if not mask.any(): continue
+        if not mask.any():
+            continue
+
         current_smape = smape(validation_data[mask], forecast_vals[mask])
-        
         if current_smape < best_smape - 0.1:
             best_smape, best_weights = current_smape, weights
-            
+
     return best_weights, best_smape
 
 def perform_correlation_analysis(bu_data: pd.DataFrame, bu_name: str):
-    """Calculates the Pearson correlation of all numeric features against the target variable."""
+    """Compute Pearson correlation of all numeric features vs target."""
     correlations, target_col = [], 'TotalCallsOffered'
+    if target_col not in bu_data.columns:
+        return correlations
+
     target_series = pd.to_numeric(bu_data[target_col], errors='coerce')
-    feature_cols = bu_data.select_dtypes(include=np.number).columns.drop([target_col], errors='ignore')
+    num_cols = bu_data.select_dtypes(include=[np.number]).columns
+    feature_cols = [c for c in num_cols if c != target_col]
+
     for col in feature_cols:
         predictor_series = pd.to_numeric(bu_data[col], errors='coerce')
         mask = target_series.notna() & predictor_series.notna()
-        if mask.sum() < 3: continue
-        x, y = target_series[mask].to_numpy(dtype=np.float64), predictor_series[mask].to_numpy(dtype=np.float64)
-        if np.std(x) == 0.0 or np.std(y) == 0.0: continue
+        if mask.sum() < 3:
+            continue
+        x = target_series[mask].to_numpy(dtype=np.float64)
+        y = predictor_series[mask].to_numpy(dtype=np.float64)
+        if np.std(x) == 0.0 or np.std(y) == 0.0:
+            continue
         try:
             corr, p_val = pearsonr(x, y)
-            correlations.append({'bu': bu_name, 'variable': col, 'pearson_correlation': float(corr), 'p_value': float(p_val)})
-        except Exception: continue
+            correlations.append({
+                'bu': bu_name,
+                'variable': col,
+                'pearson_correlation': float(corr),
+                'p_value': float(p_val)
+            })
+        except Exception:
+            continue
+
     return correlations
 
 # ------------------- MAIN EXECUTION -------------------------
 try:
-    logger.info("Starting Credit Forecasting v3.16 (Final Corrected)...")
+    logger.info("Starting Credit Forecasting v3.16.1 (Final Corrected++)...")
 
     # 1) Fetch and prepare data from BigQuery source file.
     source_df = bigquery_manager.run_gbq_sql(SQL_QUERY_PATH, return_dataframe=True).rename(columns={'Month': 'date'})
     source_df['date'] = pd.to_datetime(source_df['date'])
     source_df['TotalCallsOffered'] = pd.to_numeric(source_df['TotalCallsOffered'], errors='coerce')
-    df = source_df[['date', 'bu', 'VolumeType', 'TotalCallsOffered']].drop_duplicates().sort_values(['bu', 'date']).reset_index(drop=True)
 
-    # 2) Feature Engineering: Create variables for the models to use.
-    df['trend'] = df.groupby(['VolumeType','bu']).cumcount() + 1
-    def add_target_lags(frame, voltype, lags):
+    # Normalize column names we need
+    required_cols = {'date', 'bu', 'VolumeType', 'TotalCallsOffered'}
+    missing = required_cols - set(source_df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns from SQL result: {missing}")
+
+    df = (
+        source_df[list(required_cols)]
+        .drop_duplicates()
+        .sort_values(['bu', 'date'])
+        .reset_index(drop=True)
+    )
+
+    # 2) Feature Engineering: lags + trend
+    df['VolumeType'] = df['VolumeType'].astype(str)
+    df['trend'] = df.groupby(['VolumeType', 'bu']).cumcount() + 1
+
+    def add_target_lags(frame: pd.DataFrame, voltype: str, lags: list[int]):
         m = frame['VolumeType'] == voltype
-        for L in lags: frame.loc[m, f'TotalCallsOffered_lag_{L}'] = frame[m].groupby('bu')['TotalCallsOffered'].shift(L)
+        grp = frame[m].groupby('bu', group_keys=False)
+        for L in lags:
+            frame.loc[m, f'TotalCallsOffered_lag_{L}'] = grp['TotalCallsOffered'].shift(L)
 
+    # Phone lags and Chat lags per spec
     add_target_lags(df, 'Phone', [2, 3, 6, 12])
-    add_target_lags(df, 'Chat', [1, 2, 3])
+    add_target_lags(df, 'Chat',  [1, 2, 3])
 
-    # 3) Initialize lists to hold results from each BU.
-    forecasts, audit_rows, all_modeling_data, correlation_results, model_summaries = [], [], [], [], []
+    # 3) Collectors
+    forecasts = []
+    audit_rows = []
+    all_modeling_data = []
+    correlation_results = []
+    model_summaries = []
 
     # ======================== PHONE: WBL vs OLS BAKE-OFF ============================
-    logger.info("\n" + "="*60 + "\nProcessing Channel: Phone\n" + "="*60)
+    logger.info("\n" + "=" * 60 + "\nProcessing Channel: Phone\n" + "=" * 60)
     phone_df = df[df['VolumeType'] == 'Phone'].copy()
-    phone_df.dropna(subset=['TotalCallsOffered_lag_12'], inplace=True) # Ensure enough history for lag_12.
 
-    for bu_name in phone_df['bu'].unique():
+    # Require enough history to compute lag_12 reliably
+    phone_df = phone_df[~phone_df['TotalCallsOffered_lag_12'].isna()].copy()
+
+    for bu_name in phone_df['bu'].dropna().unique():
         logger.info(f"\n--- Phone :: BU: {bu_name} ---")
-        bu = phone_df[phone_df['bu'] == bu_name].set_index('date').sort_index().copy()
+        bu = (
+            phone_df[phone_df['bu'] == bu_name]
+            .set_index('date')
+            .sort_index()
+            .copy()
+        )
+
+        # Keep a monthly frequency index for time-series ops
         bu_ts = bu['TotalCallsOffered'].asfreq('MS')
-        all_modeling_data.append(bu.copy())
-        
-        correlation_results.extend(perform_correlation_analysis(bu, f"Phone:{bu_name}"))
+
+        # Save modeling data & correlations
+        all_modeling_data.append(bu.reset_index().copy())
+        correlation_results.extend(perform_correlation_analysis(bu.reset_index(), f"Phone:{bu_name}"))
 
         if len(bu) <= VAL_LEN_PHONE_6M:
             logger.warning(f"  Not enough data for validation. Skipping forecast for {bu_name}.")
             continue
-        train, valid = bu.iloc[:-VAL_LEN_PHONE_6M], bu.iloc[-VAL_LEN_PHONE_6M:]
-        y_val, y_tr = valid['TotalCallsOffered'], train['TotalCallsOffered']
+
+        # Split train/validation on time
+        train = bu.iloc[:-VAL_LEN_PHONE_6M].copy()
+        valid = bu.iloc[-VAL_LEN_PHONE_6M:].copy()
+        y_tr = train['TotalCallsOffered']
+        y_val = valid['TotalCallsOffered']
 
         # --- Model 1: WBL ---
         wbl_lags = [2, 3, 6, 12]
         wbl_weights, wbl_smape = find_best_weights(bu_ts, wbl_lags, VAL_LEN_PHONE_6M, GRID_STEP)
         logger.info(f"  -> WBL SMAPE={f'{wbl_smape:.2f}' if np.isfinite(wbl_smape) else 'N/A'}")
 
-        # --- Model 2: OLS (using statsmodels) ---
-        ols_feats = ['trend', 'TotalCallsOffered_lag_2', 'TotalCallsOffered_lag_3', 'TotalCallsOffered_lag_6', 'TotalCallsOffered_lag_12']
-        train_data_for_ols = pd.concat([train[ols_feats], y_tr], axis=1).dropna()
-        
-        ols_smape = np.inf
-        ols = None
-        
-        if not train_data_for_ols.empty:
-            y_tr_clean = train_data_for_ols['TotalCallsOffered']
-            Xtr_clean = train_data_for_ols[ols_feats]
-            
-            imputer = SimpleImputer(strategy='mean').fit(Xtr_clean)
-            
-            # ** FIX ** Pass pandas DataFrame to add_constant to preserve feature names for the summary.
-            Xtr_const = sm.add_constant(Xtr_clean)
-            
-            # ** FIX ** Convert the target variable to a NumPy float array to satisfy statsmodels.
-            y_tr_np = y_tr_clean.to_numpy(dtype=float)
+        # --- Model 2: OLS (statsmodels) ---
+        ols_feats = ['trend',
+                     'TotalCallsOffered_lag_2',
+                     'TotalCallsOffered_lag_3',
+                     'TotalCallsOffered_lag_6',
+                     'TotalCallsOffered_lag_12']
 
-            ols = sm.OLS(y_tr_np, Xtr_const).fit()
-            
-            Xv_imp = imputer.transform(valid[ols_feats])
-            Xv_const = sm.add_constant(Xv_imp)
-            ols_smape = smape(y_val, ols.predict(Xv_const))
-        
+        # Build numeric train frame and drop rows w/ missing y
+        train_ols = (
+            pd.concat([train[ols_feats], y_tr.rename('TotalCallsOffered')], axis=1)
+            .apply(pd.to_numeric, errors='coerce')
+            .dropna(subset=['TotalCallsOffered'])
+        )
+
+        ols_smape = np.inf
+        ols_fit = None
+        imputer = None
+
+        if not train_ols.empty:
+            # X train: coerce numeric & impute
+            Xtr_clean = train_ols[ols_feats].apply(pd.to_numeric, errors='coerce')
+            imputer = SimpleImputer(strategy='mean')
+            Xtr_imp = imputer.fit_transform(Xtr_clean)
+
+            # Keep DataFrame for column names
+            Xtr_imp_df = pd.DataFrame(Xtr_imp, columns=ols_feats, index=Xtr_clean.index)
+
+            # Add constant and ensure float dtype for statsmodels
+            Xtr_const = sm.add_constant(Xtr_imp_df, has_constant='add').astype(float)
+
+            # y train as float ndarray
+            y_tr_np = train_ols['TotalCallsOffered'].to_numpy(dtype=float)
+
+            # Fit OLS
+            ols_fit = sm.OLS(y_tr_np, Xtr_const).fit()
+
+            # Validation using same pipeline
+            Xv = valid[ols_feats].apply(pd.to_numeric, errors='coerce')
+            Xv_imp = imputer.transform(Xv)
+            Xv_imp_df = pd.DataFrame(Xv_imp, columns=ols_feats, index=Xv.index)
+            Xv_const = sm.add_constant(Xv_imp_df, has_constant='add').astype(float)
+            ols_pred_val = ols_fit.predict(Xv_const)
+            ols_smape = smape(y_val, ols_pred_val)
+
         logger.info(f"  -> OLS SMAPE={f'{ols_smape:.2f}' if np.isfinite(ols_smape) else 'N/A'}")
-        
-        # --- Winner Selection ---
+
+        # Winner selection
         winner = 'OLS' if ols_smape < wbl_smape else 'WBL'
         winner_smape = min(ols_smape, wbl_smape)
         logger.info(f"✓ WINNER Phone:{bu_name}: {winner} (SMAPE {f'{winner_smape:.2f}' if np.isfinite(winner_smape) else 'N/A'})")
-        
-        if winner == 'OLS' and ols is not None:
-            summary = ols.summary().as_text()
+
+        # Persist OLS summary if OLS won
+        if winner == 'OLS' and ols_fit is not None:
+            summary = ols_fit.summary().as_text()
             model_summaries.append(f"--- OLS Summary for BU: Phone:{bu_name} (Winner) ---\n{summary}\n\n")
-        
+
         audit_rows.append({
-            'channel': 'Phone', 'bu': bu_name, 'winner': winner, 'winner_smape': winner_smape if np.isfinite(winner_smape) else None,
-            'wbl_smape': wbl_smape if np.isfinite(wbl_smape) else None, 'ols_smape': ols_smape if np.isfinite(ols_smape) else None,
-            'details': json.dumps(to_native({'wbl_weights': wbl_weights, 'ols_features': ols_feats}))
+            'channel': 'Phone',
+            'bu': bu_name,
+            'winner': winner,
+            'winner_smape': winner_smape if np.isfinite(winner_smape) else None,
+            'wbl_smape': wbl_smape if np.isfinite(wbl_smape) else None,
+            'ols_smape': ols_smape if np.isfinite(ols_smape) else None,
+            'details': json.dumps(to_native({
+                'wbl_weights': wbl_weights,
+                'ols_features': ols_feats
+            }))
         })
 
-        # --- Produce 12m recursive forecast with the winning model ---
+        # --- 12-month recursive forecast using the winner ---
         if np.isfinite(winner_smape):
-            hist, future_idx = deque(bu['TotalCallsOffered'].tolist(), maxlen=24), pd.date_range(bu.index[-1], periods=FORECAST_HORIZON + 1, freq='MS')[1:]
+            hist = deque(bu['TotalCallsOffered'].tolist(), maxlen=24)
+            future_idx = pd.date_range(bu.index[-1], periods=FORECAST_HORIZON + 1, freq='MS')[1:]
+
             for i, d in enumerate(future_idx, 1):
                 pred = 0.0
                 if winner == 'WBL':
                     if wbl_weights:
+                        # Gather available lag values from history
                         lags_to_use = {L: hist[-L] for L in wbl_weights if len(hist) >= L}
                         pred = sum(wbl_weights.get(L, 0.0) * val for L, val in lags_to_use.items() if np.isfinite(val))
-                elif winner == 'OLS':
-                    if ols is not None:
-                        row = {'trend': train['trend'].max() + i}
-                        for L in [2, 3, 6, 12]: row[f'TotalCallsOffered_lag_{L}'] = hist[-L] if len(hist) >= L else np.nan
+                else:  # OLS
+                    if ols_fit is not None and imputer is not None:
+                        row = {
+                            'trend': float(train['trend'].max() + i),
+                            'TotalCallsOffered_lag_2': hist[-2] if len(hist) >= 2 else np.nan,
+                            'TotalCallsOffered_lag_3': hist[-3] if len(hist) >= 3 else np.nan,
+                            'TotalCallsOffered_lag_6': hist[-6] if len(hist) >= 6 else np.nan,
+                            'TotalCallsOffered_lag_12': hist[-12] if len(hist) >= 12 else np.nan
+                        }
                         future_df = pd.DataFrame([row], columns=ols_feats)
                         future_imp = imputer.transform(future_df)
-                        future_const = sm.add_constant(future_imp)
-                        pred = ols.predict(future_const)[0]
-                
-                hist.append(pred)
-                forecasts.append({'fx_date': d, 'client_id': bu_name, 'vol_type': 'phone', 'fx_vol': safe_round(pred), 'fx_id': f"{winner.lower()}_phone_{STAMP:%Y%m%d}", 'fx_status': "A", 'load_ts': STAMP})
+                        future_imp_df = pd.DataFrame(future_imp, columns=ols_feats, index=future_df.index)
+                        future_const = sm.add_constant(future_imp_df, has_constant='add').astype(float)
+                        pred = float(ols_fit.predict(future_const)[0])
 
-    # ======================== CHAT: WLB(1,2,3) ================================
-    logger.info("\n" + "="*60 + "\nProcessing Channel: Chat\n" + "="*60)
+                hist.append(pred)
+                forecasts.append({
+                    'fx_date': d,
+                    'client_id': bu_name,
+                    'vol_type': 'phone',
+                    'fx_vol': safe_round(pred),
+                    'fx_id': f"{winner.lower()}_phone_{STAMP:%Y%m%d}",
+                    'fx_status': "A",
+                    'load_ts': STAMP
+                })
+
+    # ======================== CHAT: WBL(1,2,3) ================================
+    logger.info("\n" + "=" * 60 + "\nProcessing Channel: Chat\n" + "=" * 60)
     chat_df = df[df['VolumeType'] == 'Chat'].copy()
-    for bu_name in chat_df['bu'].unique():
+
+    for bu_name in chat_df['bu'].dropna().unique():
         logger.info(f"\n--- Chat :: BU: {bu_name} ---")
-        bu = (chat_df[chat_df['bu'] == bu_name].set_index('date').sort_index().copy())
+        bu = (
+            chat_df[chat_df['bu'] == bu_name]
+            .set_index('date')
+            .sort_index()
+            .copy()
+        )
         bu_ts = bu['TotalCallsOffered'].asfreq('MS')
-        all_modeling_data.append(bu.copy())
-        correlation_results.extend(perform_correlation_analysis(bu, f"Chat:{bu_name}"))
+
+        # Save modeling slice & correlations
+        all_modeling_data.append(bu.reset_index().copy())
+        correlation_results.extend(perform_correlation_analysis(bu.reset_index(), f"Chat:{bu_name}"))
 
         if len(bu) <= VAL_LEN_CHAT_3M:
             logger.warning(f"  Not enough data for 3m validation. Skipping forecast for {bu_name}.")
             continue
 
         wbl_weights, wbl_smape = find_best_weights(bu_ts, [1, 2, 3], VAL_LEN_CHAT_3M, GRID_STEP)
-        logger.info(f"  -> Chat WLB(1,2,3) SMAPE={f'{wlb_smape:.2f}' if np.isfinite(wbl_smape) else 'N/A'}")
-        audit_rows.append({'channel': 'Chat', 'bu': bu_name, 'winner': 'WLB(1,2,3)', 'winner_smape': wlb_smape if np.isfinite(wlb_smape) else None, 'details': json.dumps(to_native({'weights': wlb_weights}))})
+        logger.info(f"  -> Chat WBL(1,2,3) SMAPE={f'{wbl_smape:.2f}' if np.isfinite(wbl_smape) else 'N/A'}")
+
+        audit_rows.append({
+            'channel': 'Chat',
+            'bu': bu_name,
+            'winner': 'WBL(1,2,3)',
+            'winner_smape': wbl_smape if np.isfinite(wbl_smape) else None,
+            'details': json.dumps(to_native({'weights': wbl_weights}))
+        })
 
         if wbl_weights:
             hist = deque(bu_ts.tolist(), maxlen=24)
@@ -270,63 +389,40 @@ try:
                 lags_to_use = {L: hist[-L] for L in wbl_weights if len(hist) >= L}
                 pred = sum(wbl_weights.get(L, 0.0) * val for L, val in lags_to_use.items() if np.isfinite(val))
                 hist.append(pred)
-                forecasts.append({'fx_date': d, 'client_id': bu_name, 'vol_type': 'chat', 'fx_vol': safe_round(pred), 'fx_id': f"wlb123_chat_{STAMP:%Y%m%d}", 'fx_status': "A", 'load_ts': STAMP})
+                forecasts.append({
+                    'fx_date': d,
+                    'client_id': bu_name,
+                    'vol_type': 'chat',
+                    'fx_vol': safe_round(pred),
+                    'fx_id': f"wlb123_chat_{STAMP:%Y%m%d}",
+                    'fx_status': "A",
+                    'load_ts': STAMP
+                })
         else:
             logger.warning(f"  No valid weights learned for Chat:{bu_name}; skipping forecast.")
 
-    # 4) Save all local artifact files
+    # ------------------- 4) Save all local artifact files --------------------
     if audit_rows:
         pd.DataFrame(audit_rows).to_csv(MODEL_EVAL_CSV, index=False)
         logger.info(f"✓ Model evaluation results saved to {MODEL_EVAL_CSV}")
+
     if all_modeling_data:
-        pd.concat(all_modeling_data).to_csv(MODELING_DATA_CSV, index=False)
+        pd.concat(all_modeling_data, ignore_index=True).to_csv(MODELING_DATA_CSV, index=False)
         logger.info(f"✓ Combined modeling data saved to {MODELING_DATA_CSV}")
+
     if correlation_results:
         pd.DataFrame(correlation_results).to_csv(CORRELATION_ANALYSIS_CSV, index=False)
         logger.info(f"✓ Correlation analysis saved to {CORRELATION_ANALYSIS_CSV}")
-    if model_summaries:
-        with open(MODEL_SUMMARIES_FILE, 'w') as f: f.writelines(model_summaries)
-        logger.info(f"✓ OLS model summaries saved to {MODEL_SUMMARIES_FILE}")
+
     if forecasts:
         fx_df = pd.DataFrame(forecasts).sort_values(['client_id', 'vol_type', 'fx_date'])
         fx_df.to_csv(FORECAST_RESULTS_CSV, index=False)
         logger.info(f"✓ Forecast data saved locally to {FORECAST_RESULTS_CSV}")
-    else: logger.warning("No forecasts were generated.")
+    else:
+        logger.warning("No forecasts were generated.")
 
     logger.info("Script finished successfully.")
 
 except Exception as exc:
+    # Note: is_test=True keeps handling local; adjust if you want real email alerts
     email_manager.handle_error("Credit Forecast Script Failure", exc, is_test=True)
-
-(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_299_File.py
-Traceback (most recent call last):
-  File "c:\WFM_Scripting\Forecasting\Rpt_299_File.py", line 299, in <module>
-    email_manager.handle_error("Credit Forecast Script Failure", exc, is_test=True)
-  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1319, in handle_error
-    raise exception
-  File "c:\WFM_Scripting\Forecasting\Rpt_299_File.py", line 204, in <module>
-    ols = sm.OLS(y_tr_np, Xtr_const).fit()
-          ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\regression\linear_model.py", line 921, in __init__
-    super().__init__(endog, exog, missing=missing,
-  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\regression\linear_model.py", line 746, in __init__
-    super().__init__(endog, exog, missing=missing,
-  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\regression\linear_model.py", line 200, in __init__
-    super().__init__(endog, exog, **kwargs)
-  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\base\model.py", line 270, in __init__
-    super().__init__(endog, exog, **kwargs)
-  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\base\model.py", line 95, in __init__
-    self.data = self._handle_data(endog, exog, missing, hasconst,
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\base\model.py", line 135, in _handle_data
-    data = handle_data(endog, exog, missing, hasconst, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\base\data.py", line 675, in handle_data
-    return klass(endog, exog=exog, missing=missing, hasconst=hasconst,
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\base\data.py", line 84, in __init__
-    self.endog, self.exog = self._convert_endog_exog(endog, exog)
-                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\statsmodels\base\data.py", line 509, in _convert_endog_exog
-    raise ValueError("Pandas data cast to numpy dtype of object. "
-ValueError: Pandas data cast to numpy dtype of object. Check input data with np.asarray(data).
