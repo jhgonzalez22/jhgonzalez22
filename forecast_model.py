@@ -1,12 +1,15 @@
 """
-CX Credit - Call Volume Forecast - Production Hybrid (Phone: CWLB/XGB/Native3mGR; Chat: WLB/XGB + LagRule) v2.5
+CX Credit - Call Volume Forecast - Production Hybrid v2.6
 
-Changes:
- - vol_type strictly 'phone' or 'chat'
- - Phone models: CWLB, XGB, SeasonalNaive3mGR (aka native3mg). Winner by 6m SMAPE drives forecast.
- - Chat: still evaluate WLB vs XGB for audit, but production forecast uses LagRule:
-     • months 1–3: use lag 1 and 3 (weighted equally)
-     • months 4+: use lag 3 and 6 (weighted equally)
+- vol_type strictly 'phone' or 'chat'
+- PHONE: CWLB vs XGB vs Native3mGR; winner by 6m SMAPE; recursive forecast
+- CHAT : WLB with lags {1,3} only; weights learned on validation (6m SMAPE);
+         recursive forecast using those fixed weights
+
+Hardening:
+ - Pearson numeric coercion + guards
+ - Safe JSON serialization (NumPy -> Python native)
+ - Safe logging for SMAPE values
 """
 
 # ------------------- standard imports -----------------------
@@ -87,36 +90,54 @@ def safe_expm1(x, lo=-20.0, hi=20.0):
     return np.expm1(np.clip(arr, lo, hi))
 
 def find_best_weights(ts: pd.Series, lags: list, constraints: dict, val_window_len: int, step: float):
+    """Grid-search convex weights on specified lags over the last val_window_len months."""
     val_window_len = min(val_window_len, max(3, len(ts) // 2))
     if len(ts) < val_window_len + max(lags):
         return None, np.inf, None
+
     validation_data = ts.iloc[-val_window_len:]
     best_weights, best_smape, best_preds = None, np.inf, None
+
     num_lags = len(lags)
     weight_iters = [np.arange(0, 1.0 + step, step) for _ in range(num_lags - 1)]
     for W in itertools.product(*weight_iters):
-        if sum(W) > 1.0 + 1e-9: continue
+        if sum(W) > 1.0 + 1e-9:
+            continue
         all_w = list(W) + [1.0 - sum(W)]
         weights = {int(l): float(w) for l, w in zip(lags, all_w)}
+
+        # Per-lag constraints (optional)
         valid = True
         for lag, limits in constraints.items():
             if isinstance(lag, int) and lag in weights:
-                if 'max' in limits and weights[lag] > limits['max'] + 1e-9: valid = False; break
-                if 'min' in limits and weights[lag] < limits['min'] - 1e-9: valid = False; break
-        if not valid: continue
+                if 'max' in limits and weights[lag] > limits['max'] + 1e-9:
+                    valid = False; break
+                if 'min' in limits and weights[lag] < limits['min'] - 1e-9:
+                    valid = False; break
+        if not valid:
+            continue
+
+        # Combined constraints (optional)
         if 'combined' in constraints:
             for combo in constraints['combined']:
                 combo_sum = sum(weights.get(l, 0.0) for l in combo['lags'])
-                if 'min' in combo and combo_sum < combo['min'] - 1e-9: valid = False; break
-            if not valid: continue
+                if 'min' in combo and combo_sum < combo['min'] - 1e-9:
+                    valid = False; break
+            if not valid:
+                continue
+
         forecast_vals = 0.0
         for lag, w in weights.items():
             forecast_vals += ts.shift(lag).reindex(validation_data.index) * w
+
         mask = forecast_vals.notna() & validation_data.notna()
-        if not mask.any(): continue
+        if not mask.any():
+            continue
+
         current_smape = smape(validation_data[mask], forecast_vals[mask])
         if current_smape < best_smape - 0.1:
             best_smape, best_weights, best_preds = current_smape, weights, forecast_vals
+
     return best_weights, best_smape, best_preds
 
 def perform_statistical_tests(bu_data: pd.DataFrame, bu_name: str, features: list):
@@ -153,9 +174,8 @@ def perform_statistical_tests(bu_data: pd.DataFrame, bu_name: str, features: lis
         logger.info(f"  ADF P-Value: {results['adf_p_value']:.4f} (Stationary: {results['is_stationary']})")
     return results
 
-# SeasonalNaive3mGR (native3mg) helpers
+# SeasonalNaive3mGR (native3mg) helpers for PHONE
 def compute_3m_yoy_factor(series: pd.Series) -> float:
-    """Mean of last 1..3 recent YoY ratios (t-i)/(t-12-i)."""
     s = series.dropna()
     ratios = []
     for k in [1, 2, 3]:
@@ -164,12 +184,9 @@ def compute_3m_yoy_factor(series: pd.Series) -> float:
             den = s.iloc[-12 - k]
             if den and np.isfinite(num) and np.isfinite(den) and den != 0:
                 ratios.append(num / den)
-    if ratios:
-        return float(np.mean(ratios))
-    return 1.0
+    return float(np.mean(ratios)) if ratios else 1.0
 
 def seasonal_naive_3m_gr_predict(train_series: pd.Series, pred_index: pd.DatetimeIndex) -> pd.Series:
-    """Predict validation using y[t-12] * avg 3m YoY factor computed from train end."""
     factor = compute_3m_yoy_factor(train_series)
     preds = []
     s = train_series.copy()
@@ -180,7 +197,7 @@ def seasonal_naive_3m_gr_predict(train_series: pd.Series, pred_index: pd.Datetim
 
 # ------------------- MAIN EXECUTION -------------------------
 try:
-    logger.info("Starting Credit Forecasting v2.5 (Phone + Chat)...")
+    logger.info("Starting Credit Forecasting v2.6 (Phone + Chat)...")
 
     # 1) Fetch & Prepare Data
     source_df = bigquery_manager.run_gbq_sql(SQL_QUERY_PATH, return_dataframe=True)
@@ -189,7 +206,7 @@ try:
     source_df['TotalCallsOffered'] = pd.to_numeric(source_df['TotalCallsOffered'], errors='coerce')
     df = source_df[['date', 'bu', 'VolumeType', 'TotalCallsOffered']].drop_duplicates().sort_values(['bu', 'date'])
 
-    # 2) Economic Data
+    # 2) Economic Data (still merged; used by Phone/XGB)
     fred_df = bigquery_manager.run_gbq_sql(FRED_GBQ_QUERY, return_dataframe=True)
     lagged_econ_cols = []
     if not fred_df.empty:
@@ -205,7 +222,7 @@ try:
         for c in ECONOMIC_FEATURES + lagged_econ_cols:
             df[c] = pd.to_numeric(df[c], errors='coerce')
 
-    # 3) Features common
+    # 3) Feature engineering common
     df['month']     = df['date'].dt.month
     df['sin_month'] = np.sin(2 * np.pi * df['month'] / 12)
     df['cos_month'] = np.cos(2 * np.pi * df['month'] / 12)
@@ -218,15 +235,15 @@ try:
             frame.loc[m, f'lag_{L}'] = frame[m].groupby('bu')['TotalCallsOffered'].shift(L)
 
     add_target_lags(df, 'Phone', [1,2,3,6,12])
-    add_target_lags(df, 'Chat',  [1,3,6])
+    add_target_lags(df, 'Chat',  [1,3])  # Chat uses only lag_1 and lag_3
 
     # Outputs
     forecasts, audit_rows, all_modeling_data, stat_test_results, xgb_imp_rows = [], [], [], [], []
 
-    # -------- PHONE: CWLB vs XGB vs SeasonalNaive3mGR ----------
+    # -------- PHONE: CWLB vs XGB vs Native3mGR ----------
     logger.info("\n" + "="*60 + "\nProcessing Channel: Phone\n" + "="*60)
     phone_df = df[df['VolumeType'] == 'Phone'].copy()
-    req_cols = ['lag_12']  # need seasonal anchor for native3mg and others
+    req_cols = ['lag_12']
     if lagged_econ_cols:
         req_cols += [c for c in lagged_econ_cols if c.endswith('_lag_12')]
     phone_df.dropna(subset=[c for c in req_cols if c in phone_df.columns], inplace=True)
@@ -238,7 +255,7 @@ try:
         bu_ts = bu['TotalCallsOffered'].asfreq('MS')
         all_modeling_data.append(bu.copy())
 
-        # XGB features
+        # XGB features (Phone)
         xgb_feats = ['trend','sin_month','cos_month','lag_3','lag_6','lag_12'] + \
                     [c for c in [f'{x}_lag_{l}' for x in ECONOMIC_FEATURES for l in [3,6,12]] if c in bu.columns]
 
@@ -267,7 +284,7 @@ try:
         imp = {str(f): float(s) for f, s in zip(xgb.feature_names_in_, xgb.feature_importances_)}
         xgb_imp_rows.append({'bu': f"Phone:{bu_name}", 'feature_importance': json.dumps(to_native(imp))})
 
-        # SeasonalNaive3mGR (native3mg)
+        # Native3mGR
         native_val_preds = seasonal_naive_3m_gr_predict(train['TotalCallsOffered'], valid.index)
         native_smape = smape(y_val, native_val_preds)
         logger.info(f"  -> Native3mGR SMAPE={native_smape:.2f}")
@@ -286,23 +303,21 @@ try:
             'details': json.dumps(to_native({'cwlb_weights': cwlb_weights}))
         })
 
-        # Forecast using the winning model
+        # Forecast with the winning model
         if np.isfinite(winner_smape):
             hist = deque(bu_ts.tolist(), maxlen=24)
             future_idx = pd.date_range(bu_ts.index[-1], periods=FORECAST_HORIZON + 1, freq='MS')[1:]
 
-            # Precompute long weights if CWLB wins
             long_weights = None
             if winner == 'CWLB':
                 long_weights, _, _ = find_best_weights(bu_ts, [3,6,12], {3:{'min':0.4}, 6:{'min':0.2}, 12:{'min':0.1}}, 12, GRID_STEP)
-
-            # Factor for native3mGR if needed
             native_factor = compute_3m_yoy_factor(train['TotalCallsOffered']) if winner == 'Native3mGR' else None
 
             for i, d in enumerate(future_idx, 1):
                 if winner == 'CWLB' and cwlb_weights:
                     if long_weights is None:
-                        lags_to_use = {L: hist[-L] for L in [1,3,6,12] if len(hist) >= L}
+                        Ls = [1,3,6,12]
+                        lags_to_use = {L: hist[-L] for L in Ls if len(hist) >= L}
                         pred = sum(cwlb_weights.get(L, 0.0) * lags_to_use[L] for L in lags_to_use)
                     else:
                         if i == 1:
@@ -327,7 +342,7 @@ try:
                     pred = safe_expm1(xgb.predict(pd.DataFrame([row])[xgb_feats])[0])
                 else:  # Native3mGR
                     t12 = hist[-12] if len(hist) >= 12 else hist[-1]
-                    factor = native_factor if native_factor and np.isfinite(native_factor) else 1.0
+                    factor = native_factor if (native_factor is not None and np.isfinite(native_factor)) else 1.0
                     pred = (t12 or 0.0) * factor
 
                 hist.append(pred)
@@ -337,11 +352,11 @@ try:
                     'fx_status': "A", 'load_ts': STAMP
                 })
 
-    # -------- CHAT: WLB vs XGB audit, but production uses LagRule (1,3 then 3,6) ----------
-    logger.info("\n" + "="*60 + "\nProcessing Channel: Chat\n" + "="*60)
+    # -------- CHAT: WLB (lags {1,3}) ONLY; learn weights; recursive forecast ----------
+    logger.info("\n" + "="*60 + "\nProcessing Channel: Chat (WLB lag1,lag3 only)\n" + "="*60)
     chat_df = df[df['VolumeType'] == 'Chat'].copy()
-    # need basic lags present
-    chat_df.dropna(subset=[c for c in ['lag_1','lag_3','lag_6'] if c in chat_df.columns], inplace=True)
+    # Need lag_3 present at least to start recursive forecasting
+    chat_df.dropna(subset=[c for c in ['lag_3'] if c in chat_df.columns], inplace=True)
 
     for bu_name in chat_df['bu'].unique():
         logger.info(f"\n--- Chat :: BU: {bu_name} ---")
@@ -350,67 +365,47 @@ try:
         bu_ts = bu['TotalCallsOffered'].asfreq('MS')
         all_modeling_data.append(bu.copy())
 
-        # XGB features (trend/seasonality + target lags 1/3/6 + econ 3/6/12 if present)
-        xgb_feats = ['trend','sin_month','cos_month'] + \
-                    [c for c in ['lag_1','lag_3','lag_6'] if c in bu.columns] + \
-                    [f'{c}_lag_{l}' for c in ECONOMIC_FEATURES for l in [3,6,12] if f'{c}_lag_{l}' in bu.columns]
+        # Stats (basic — just on available features)
+        xgb_feats_placeholder = ['lag_1','lag_3']
+        stat_test_results.append(perform_statistical_tests(bu, f"Chat:{bu_name}", [f for f in xgb_feats_placeholder if f in bu.columns]))
 
-        stat_test_results.append(perform_statistical_tests(bu, f"Chat:{bu_name}", xgb_feats))
         if len(bu) <= VAL_LEN_6M:
             logger.warning(f"  Not enough data for 6m validation: Chat:{bu_name}; skipping.")
             continue
+
+        # Learn dynamic weights on {1,3} via validation SMAPE
         train, valid = bu.iloc[:-VAL_LEN_6M], bu.iloc[-VAL_LEN_6M:]
-        y_val = valid['TotalCallsOffered']
-
-        # WLB for chat: lags [1,3,6], cap lag1, ensure some weight on 3/6 combined
         wlb_weights, wlb_smape, _ = find_best_weights(
-            bu_ts, [1,3,6], {1:{'max':0.5}, 3:{'min':0.25}, 'combined':[{'lags':[3,6], 'min':0.5}]},
-            VAL_LEN_6M, GRID_STEP
+            bu_ts, [1,3], constraints={}, val_window_len=VAL_LEN_6M, step=GRID_STEP
         )
-        logger.info(f"  -> WLB   SMAPE={f'{wlb_smape:.2f}' if np.isfinite(wlb_smape) else 'N/A'}")
+        wstr = f"{wlb_weights}" if wlb_weights else "{}"
+        logger.info(f"  -> Chat WLB(1,3) SMAPE={f'{wlb_smape:.2f}' if np.isfinite(wlb_smape) else 'N/A'} weights={wstr}")
 
-        # XGB
-        Xtr, Xv = train[xgb_feats], valid[xgb_feats]
-        ytr = train['TotalCallsOffered']
-        xgb_c = XGBRegressor(objective="reg:squarederror", n_estimators=100, learning_rate=0.05, max_depth=3, random_state=42)
-        xgb_c.fit(Xtr, np.log1p(ytr))
-        xgb_preds = safe_expm1(xgb_c.predict(Xv))
-        xgb_smape_c = smape(y_val, xgb_preds)
-        logger.info(f"  -> XGB   SMAPE={xgb_smape_c:.2f}")
-        imp = {str(f): float(s) for f, s in zip(xgb_c.feature_names_in_, xgb_c.feature_importances_)}
-        xgb_imp_rows.append({'bu': f"Chat:{bu_name}", 'feature_importance': json.dumps(to_native(imp))})
-
-        # Record audit (winner among audit models only)
-        audit_winner = 'WLB' if (wlb_smape <= xgb_smape_c) else 'XGBoost'
         audit_rows.append({
-            'channel': 'Chat', 'bu': bu_name, 'winner': audit_winner,
-            'winner_smape': float(min(wlb_smape, xgb_smape_c)) if np.isfinite(min(wlb_smape, xgb_smape_c)) else None,
-            'wlb_smape': float(wlb_smape) if np.isfinite(wlb_smape) else None,
-            'xgb_smape': float(xgb_smape_c) if np.isfinite(xgb_smape_c) else None,
-            'details': json.dumps(to_native({'wlb_weights': wlb_weights}))
+            'channel': 'Chat', 'bu': bu_name, 'winner': 'WLB(1,3)',
+            'winner_smape': float(wlb_smape) if np.isfinite(wlb_smape) else None,
+            'details': json.dumps(to_native({'weights': wlb_weights}))
         })
 
-        # Production forecast for Chat using LagRule:
-        #  - months 1–3: average(lag1, lag3)
-        #  - months 4+:  average(lag3, lag6)
-        hist = deque(bu_ts.tolist(), maxlen=24)
-        future_idx = pd.date_range(bu_ts.index[-1], periods=FORECAST_HORIZON + 1, freq='MS')[1:]
-        for i, d in enumerate(future_idx, 1):
-            if i <= 3:
-                vals = []
-                if len(hist) >= 1: vals.append(hist[-1])
-                if len(hist) >= 3: vals.append(hist[-3])
-            else:
-                vals = []
-                if len(hist) >= 3: vals.append(hist[-3])
-                if len(hist) >= 6: vals.append(hist[-6])
-            pred = float(np.mean(vals)) if vals else (hist[-1] if len(hist) else 0.0)
-            hist.append(pred)
-            forecasts.append({
-                'fx_date': d, 'client_id': bu_name, 'vol_type': 'chat',
-                'fx_vol': safe_round(pred), 'fx_id': f"lagrule_chat_{STAMP:%Y%m%d}",
-                'fx_status': "A", 'load_ts': STAMP
-            })
+        # Recursive forecast with fixed learned weights
+        if wlb_weights:
+            hist = deque(bu_ts.tolist(), maxlen=24)
+            future_idx = pd.date_range(bu_ts.index[-1], periods=FORECAST_HORIZON + 1, freq='MS')[1:]
+            for i, d in enumerate(future_idx, 1):
+                l1 = hist[-1] if len(hist) >= 1 else np.nan
+                l3 = hist[-3] if len(hist) >= 3 else (hist[-1] if len(hist) else np.nan)
+                parts = []
+                if np.isfinite(l1): parts.append(wlb_weights.get(1, 0.0) * l1)
+                if np.isfinite(l3): parts.append(wlb_weights.get(3, 0.0) * l3)
+                pred = float(np.sum(parts)) if parts else (hist[-1] if len(hist) else 0.0)
+                hist.append(pred)
+                forecasts.append({
+                    'fx_date': d, 'client_id': bu_name, 'vol_type': 'chat',
+                    'fx_vol': safe_round(pred), 'fx_id': f"wlb13_chat_{STAMP:%Y%m%d}",
+                    'fx_status': "A", 'load_ts': STAMP
+                })
+        else:
+            logger.warning(f"  No valid weights learned for Chat:{bu_name}; skipping forecast.")
 
     # 6) Save outputs (local)
     if audit_rows:
@@ -449,7 +444,7 @@ try:
         #   AND EXISTS (
         #     SELECT 1 FROM `{DEST_TABLE}` s
         #     WHERE s.client_id = t.client_id
-        #       AND s.vol_type = t.vol_type         -- 'phone' or 'chat'
+        #       AND s.vol_type = t.vol_type
         #       AND s.fx_date = t.fx_date
         #       AND s.load_ts > t.load_ts
         #   )"""
