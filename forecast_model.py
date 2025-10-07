@@ -5,8 +5,10 @@ This script forecasts monthly phone call volumes by benchmarking a Constrained
 Weighted Lag Blend (CWLB) model against an XGBoost model with economic features.
 It is designed to generate a new forecast and push it to BigQuery every month it runs.
 
-v2.3 Fix: Corrected a data type issue in the perform_statistical_tests function
-by explicitly coercing data to numeric before correlation calculation.
+v2.3 Fixes:
+ - Statistical tests: coerce to numeric before Pearson correlations
+ - Logging: safe CWLB SMAPE formatting
+ - JSON: safely convert NumPy types (float32, int64, bool_) to native Python before json.dumps
 """
 
 # ------------------- standard imports -----------------------
@@ -69,7 +71,19 @@ STAMP              = datetime.now(pytz.timezone("America/Chicago"))
 GRID_STEP          = 0.05
 ECONOMIC_FEATURES  = ['UNRATE', 'HSN1F', 'FEDFUNDS', 'MORTGAGE30US']
 
-# ------------------- utilities -------------------------
+# ------------------- helpers -------------------------
+def to_native(obj):
+    """Recursively convert NumPy scalars/bools to Python native types for json.dumps."""
+    if isinstance(obj, dict):
+        return {to_native(k): to_native(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_native(x) for x in obj]
+    if isinstance(obj, (np.floating, np.integer)):
+        return obj.item()
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    return obj
+
 def smape(actual, forecast):
     actual, forecast = np.asarray(actual, dtype=float), np.asarray(forecast, dtype=float)
     denom = (np.abs(actual) + np.abs(forecast)) / 2.0
@@ -99,7 +113,8 @@ def find_best_weights(ts: pd.Series, lags: list, constraints: dict, val_window_l
         if sum(W) > 1.0 + 1e-9:
             continue
         all_w = list(W) + [1.0 - sum(W)]
-        weights = dict(zip(lags, all_w))
+        # Cast weights to native floats immediately (avoid NumPy dtypes leaking)
+        weights = {int(l): float(w) for l, w in zip(lags, all_w)}
 
         # Per-lag constraints
         valid = True
@@ -115,7 +130,7 @@ def find_best_weights(ts: pd.Series, lags: list, constraints: dict, val_window_l
         # Combined constraints
         if 'combined' in constraints:
             for combo in constraints['combined']:
-                combo_sum = sum(weights.get(l, 0) for l in combo['lags'])
+                combo_sum = sum(weights.get(l, 0.0) for l in combo['lags'])
                 if 'min' in combo and combo_sum < combo['min'] - 1e-9:
                     valid = False; break
             if not valid:
@@ -176,7 +191,7 @@ def perform_statistical_tests(bu_data: pd.DataFrame, bu_name: str, features: lis
         except Exception:
             continue
 
-    results['correlations'] = json.dumps(correlations)
+    results['correlations'] = json.dumps(to_native(correlations))
     logger.info(f"  --- Statistical Tests for: {bu_name} ---")
     if 'adf_p_value' in results and results['adf_p_value'] is not None:
         logger.info(f"  ADF P-Value: {results['adf_p_value']:.4f} (Stationary: {results['is_stationary']})")
@@ -221,7 +236,6 @@ try:
         for c in lagged_econ_cols + ECONOMIC_FEATURES:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
-
     else:
         lagged_econ_cols = []
 
@@ -294,27 +308,30 @@ try:
         xgb_smape = smape(y_val, xgb_preds)
         logger.info(f"  -> XGBoost evaluated: SMAPE={xgb_smape:.2f}")
 
-        # Store feature importances
-        imp = {feat: score for feat, score in zip(xgb.feature_names_in_, xgb.feature_importances_)}
-        xgb_imp_rows.append({'bu': bu_name, 'feature_importance': json.dumps(imp)})
+        # Store feature importances (cast to native types)
+        imp = {str(feat): float(score) for feat, score in zip(xgb.feature_names_in_, xgb.feature_importances_)}
+        xgb_imp_rows.append({'bu': bu_name, 'feature_importance': json.dumps(to_native(imp))})
 
         # Winner selection; compute long-horizon CWLB weights if CWLB wins
         if cwlb_smape <= xgb_smape:
-            winner, winner_smape, winner_details = 'CWLB', cwlb_smape, cwlb_weights
+            # Ensure weights are native for JSON later
+            winner_details = {int(k): float(v) for k, v in (cwlb_weights or {}).items()}
+            winner, winner_smape = 'CWLB', cwlb_smape
             long_constraints = {3: {'min': 0.4}, 6: {'min': 0.2}, 12: {'min': 0.1}}
             long_weights, _, _ = find_best_weights(bu_ts, [3, 6, 12], long_constraints, 12, GRID_STEP)
         else:
-            winner, winner_smape, winner_details = 'XGBoost', xgb_smape, {'n_estimators': 100, 'lr': 0.05, 'max_depth': 3}
+            winner_details = {'n_estimators': 100, 'lr': 0.05, 'max_depth': 3}
+            winner, winner_smape = 'XGBoost', xgb_smape
             long_weights = None
 
         logger.info(f"✓ WINNER for {bu_name}: {winner} (SMAPE: {winner_smape:.2f})")
         audit_rows.append({
             'bu': bu_name,
             'winner': winner,
-            'winner_smape': winner_smape,
-            'cwlb_smape': cwlb_smape,
-            'xgb_smape': xgb_smape,
-            'details': json.dumps(winner_details)
+            'winner_smape': float(winner_smape) if np.isfinite(winner_smape) else None,
+            'cwlb_smape': float(cwlb_smape) if np.isfinite(cwlb_smape) else None,
+            'xgb_smape': float(xgb_smape) if np.isfinite(xgb_smape) else None,
+            'details': json.dumps(to_native(winner_details))
         })
 
         # 5) Forecast generation
@@ -338,7 +355,7 @@ try:
                             lags_to_use = {3: hist[-3], 6: hist[-6], 12: hist[-12]}
                         else:
                             lags_to_use = {3: hist[-3], 6: hist[-6], 12: hist[-12]}
-                        pred = sum(cwlb_weights.get(l, 0) * v for l, v in lags_to_use.items())
+                        pred = sum(cwlb_weights.get(l, 0.0) * v for l, v in lags_to_use.items())
                     else:
                         if i == 1:
                             w, lags_to_use = cwlb_weights, {1: hist[-1], 3: hist[-3], 6: hist[-6], 12: hist[-12]}
@@ -346,7 +363,7 @@ try:
                             w, lags_to_use = cwlb_weights, {3: hist[-3], 6: hist[-6], 12: hist[-12]}
                         else:
                             w, lags_to_use = long_weights, {3: hist[-3], 6: hist[-6], 12: hist[-12]}
-                        pred = sum(w.get(lag, 0) * value for lag, value in lags_to_use.items())
+                        pred = sum(w.get(lag, 0.0) * value for lag, value in lags_to_use.items())
 
                 elif winner == 'XGBoost':
                     # Build one-row feature frame for time d
@@ -441,25 +458,3 @@ try:
 
 except Exception as exc:
     email_manager.handle_error("Credit Phone Production Script Failure", exc, is_test=True)
-
-venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_299_File.py
-Traceback (most recent call last):
-  File "c:\WFM_Scripting\Forecasting\Rpt_299_File.py", line 443, in <module>
-    email_manager.handle_error("Credit Phone Production Script Failure", exc, is_test=True)
-  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1319, in handle_error
-    raise exception
-  File "c:\WFM_Scripting\Forecasting\Rpt_299_File.py", line 299, in <module>
-    xgb_imp_rows.append({'bu': bu_name, 'feature_importance': json.dumps(imp)})
-                                                              ^^^^^^^^^^^^^^^
-  File "C:\Users\jhgonzalez\AppData\Local\Programs\Python\Python311\Lib\json\__init__.py", line 231, in dumps
-    return _default_encoder.encode(obj)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\jhgonzalez\AppData\Local\Programs\Python\Python311\Lib\json\encoder.py", line 200, in encode
-    chunks = self.iterencode(o, _one_shot=True)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\jhgonzalez\AppData\Local\Programs\Python\Python311\Lib\json\encoder.py", line 258, in iterencode
-    return _iterencode(o, 0)
-           ^^^^^^^^^^^^^^^^^
-  File "C:\Users\jhgonzalez\AppData\Local\Programs\Python\Python311\Lib\json\encoder.py", line 180, in default
-    raise TypeError(f'Object of type {o.__class__.__name__} '
-TypeError: Object of type float32 is not JSON serializable
