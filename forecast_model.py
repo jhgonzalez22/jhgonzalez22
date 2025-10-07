@@ -1,14 +1,17 @@
 """
-CX Credit - Call Volume Forecast - Production Hybrid (CWLB vs. XGB w/ GBQ FRED) v2.3
+CX Credit - Call Volume Forecast - Production Hybrid (CWLB/WLB vs. XGB w/ GBQ FRED) v2.4
 
-This script forecasts monthly phone call volumes by benchmarking a Constrained
-Weighted Lag Blend (CWLB) model against an XGBoost model with economic features.
-It is designed to generate a new forecast and push it to BigQuery every month it runs.
+Adds a Chat path:
+ - Phone (existing): target lags [1,3,6,12], econ lags [3,6,12]
+ - Chat (new)     : target lags [1,3,6],    econ lags [3,6,12]
 
-v2.3 Fixes:
- - Statistical tests: coerce to numeric before Pearson correlations
- - Logging: safe CWLB SMAPE formatting
- - JSON: safely convert NumPy types (float32, int64, bool_) to native Python before json.dumps
+Both channels benchmark a constrained Weighted Lag Blend (WLB/CWLB) vs XGBoost and
+produce 12-month forecasts. GBQ push remains commented for testing.
+
+v2.x hardening:
+ - Pearson numeric coercion + guards
+ - Safe json serialization (NumPy -> Python native)
+ - Fixed CWLB SMAPE logging
 """
 
 # ------------------- standard imports -----------------------
@@ -113,7 +116,6 @@ def find_best_weights(ts: pd.Series, lags: list, constraints: dict, val_window_l
         if sum(W) > 1.0 + 1e-9:
             continue
         all_w = list(W) + [1.0 - sum(W)]
-        # Cast weights to native floats immediately (avoid NumPy dtypes leaking)
         weights = {int(l): float(w) for l, w in zip(lags, all_w)}
 
         # Per-lag constraints
@@ -199,205 +201,229 @@ def perform_statistical_tests(bu_data: pd.DataFrame, bu_name: str, features: lis
 
 # ------------------- MAIN EXECUTION -------------------------
 try:
-    logger.info("Starting Credit Phone Forecasting Script (v2.3 Monthly Push Test)...")
+    logger.info("Starting Credit Forecasting (Phone + Chat) v2.4...")
 
-    # 1) Fetch & Prepare Data
+    # 1) Fetch & Prepare Data (keep VolumeType in frame so we can split)
     source_df = bigquery_manager.run_gbq_sql(SQL_QUERY_PATH, return_dataframe=True)
     source_df = source_df.rename(columns={'Month': 'date'})
     source_df['date'] = pd.to_datetime(source_df['date'])
+    source_df['TotalCallsOffered'] = pd.to_numeric(source_df['TotalCallsOffered'], errors='coerce')
 
-    # Filter to phone and minimal columns
-    df = source_df[source_df['VolumeType'] == 'Phone'].sort_values(['bu', 'date']).copy()
-    df = df[['date', 'bu', 'TotalCallsOffered']].drop_duplicates()
+    # Minimal columns we need (keep VolumeType to branch)
+    df = source_df[['date', 'bu', 'VolumeType', 'TotalCallsOffered']].drop_duplicates()
+    df = df.sort_values(['bu', 'date'])
 
-    # Normalize numeric early
-    df['TotalCallsOffered'] = pd.to_numeric(df['TotalCallsOffered'], errors='coerce')
-
-    # 2) Integrate Economic Data from GBQ
+    # 2) Integrate Economic Data from GBQ (monthly, with 3/6/12 lags)
     logger.info("Fetching economic data from BigQuery...")
     fred_df = bigquery_manager.run_gbq_sql(FRED_GBQ_QUERY, return_dataframe=True)
+    lagged_econ_cols = []
     if not fred_df.empty:
         fred_df['date'] = pd.to_datetime(fred_df['date'])
-        # Ensure FRED numerics are numeric
         for col in ECONOMIC_FEATURES:
             fred_df[col] = pd.to_numeric(fred_df[col], errors='coerce')
-
-        # Build econ lags on the monthly series
         fred_df = fred_df.sort_values('date').reset_index(drop=True)
         for col in ECONOMIC_FEATURES:
             for lag in [3, 6, 12]:
                 fred_df[f'{col}_lag_{lag}'] = fred_df[col].shift(lag)
+        lagged_econ_cols = [f'{col}_lag_{l}' for col in ECONOMIC_FEATURES for l in [3,6,12]]
+        df = pd.merge(df, fred_df[['date'] + ECONOMIC_FEATURES + lagged_econ_cols], on='date', how='left')
+        for c in ECONOMIC_FEATURES + lagged_econ_cols:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
 
-        # Merge on date
-        df = pd.merge(df, fred_df, on='date', how='left')
-
-        # Coerce lag columns to numeric and require enough history
-        lagged_econ_cols = [f'{col}_lag_12' for col in ECONOMIC_FEATURES]
-        for c in lagged_econ_cols + ECONOMIC_FEATURES:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors='coerce')
-    else:
-        lagged_econ_cols = []
-
-    # 3) Engineer Other Features
-    df['month'] = df['date'].dt.month
+    # 3) Feature engineering common to both channels
+    df['month']     = df['date'].dt.month
     df['sin_month'] = np.sin(2 * np.pi * df['month'] / 12)
     df['cos_month'] = np.cos(2 * np.pi * df['month'] / 12)
-    df['trend'] = df.groupby('bu').cumcount() + 1
+    df['trend']     = df.groupby(['VolumeType','bu']).cumcount() + 1
 
-    for lag in [1, 2, 3, 6, 12]:
-        df[f'lag_{lag}'] = df.groupby('bu')['TotalCallsOffered'].shift(lag)
+    # Build target lags by channel (Phone: 1/2/3/6/12; Chat: 1/3/6)
+    def add_target_lags(frame, voltype, lags):
+        m = frame['VolumeType'] == voltype
+        for L in lags:
+            frame.loc[m, f'lag_{L}'] = frame[m].groupby('bu')['TotalCallsOffered'].shift(L)
 
-    # Require core lags + econ lags (if present)
-    required_cols = ['lag_12']
-    if lagged_econ_cols:
-        required_cols += lagged_econ_cols
-    df.dropna(subset=required_cols, inplace=True)
+    add_target_lags(df, 'Phone', [1,2,3,6,12])
+    add_target_lags(df, 'Chat',  [1,3,6])
 
+    # Containers for outputs across both channels
     forecasts, audit_rows, all_modeling_data, stat_test_results, xgb_imp_rows = [], [], [], [], []
 
-    # 4) Main loop for per-BU bake-off
-    for bu_name in df['bu'].unique():
-        logger.info(f"\n{'='*40}\nProcessing BU: {bu_name}\n{'='*40}")
-        bu_df = df[df['bu'] == bu_name].set_index('date').sort_index()
+    # ------------------- per-channel runner -------------------
+    def run_channel(channel_name: str, target_lags: list, use_cw_for_phone=True):
+        """
+        channel_name: 'Phone' or 'Chat'
+        target_lags:  list of target lags to include in XGB & WLB search
+        use_cw_for_phone: if True, keeps 'CWLB' naming for Phone; otherwise generic 'WLB'
+        """
+        logger.info(f"\n{'='*60}\nProcessing Channel: {channel_name}\n{'='*60}")
+        ch_df = df[df['VolumeType'] == channel_name].copy()
 
-        # Keep numeric hygiene for modeling columns
-        bu_df['TotalCallsOffered'] = pd.to_numeric(bu_df['TotalCallsOffered'], errors='coerce')
+        # Require at least lag max and econ lag 12 present for modeling
+        required_cols = [f'lag_{max(target_lags)}']
+        if lagged_econ_cols:
+            required_cols += [f'{c}_lag_{l}' for c in ECONOMIC_FEATURES for l in [12] if f'{c}_lag_{l}' in ch_df.columns]
+        ch_df.dropna(subset=[c for c in required_cols if c in ch_df.columns], inplace=True)
 
-        bu_ts = bu_df['TotalCallsOffered'].asfreq('MS')
-        all_modeling_data.append(bu_df.copy())
+        for bu_name in ch_df['bu'].unique():
+            logger.info(f"\n--- {channel_name} :: BU: {bu_name} ---")
+            bu_df = ch_df[ch_df['bu'] == bu_name].set_index('date').sort_index().copy()
+            bu_df['TotalCallsOffered'] = pd.to_numeric(bu_df['TotalCallsOffered'], errors='coerce')
 
-        # XGB features: seasonality, trend, target lags, econ lags (3/6/12)
-        xgb_features = (['trend', 'sin_month', 'cos_month', 'lag_3', 'lag_6', 'lag_12'] +
-                        [f'{c}_lag_{l}' for c in ECONOMIC_FEATURES for l in [3, 6, 12] if f'{c}_lag_{l}' in bu_df.columns])
+            # Assemble XGB features: trend, seasonality, requested target lags, econ lags 3/6/12
+            tlag_feats = [f'lag_{L}' for L in target_lags if f'lag_{L}' in bu_df.columns]
+            econ_feats = [f'{c}_lag_{l}' for c in ECONOMIC_FEATURES for l in [3,6,12] if f'{c}_lag_{l}' in bu_df.columns]
+            xgb_features = ['trend', 'sin_month', 'cos_month'] + tlag_feats + econ_feats
 
-        # Statistical tests (robust to types)
-        stat_test_results.append(perform_statistical_tests(bu_df, bu_name, xgb_features))
+            # Stats
+            stat_test_results.append(perform_statistical_tests(bu_df, f"{channel_name}:{bu_name}", xgb_features))
 
-        # Train/validation split
-        if len(bu_df) <= VAL_LEN_6M:
-            logger.warning(f"  Not enough data for 6-month validation in {bu_name}; skipping.")
-            continue
-        train_df, valid_df = bu_df.iloc[:-VAL_LEN_6M], bu_df.iloc[-VAL_LEN_6M:]
-        y_val = valid_df['TotalCallsOffered']
+            # Train/val split
+            if len(bu_df) <= VAL_LEN_6M:
+                logger.warning(f"  Not enough data for 6m validation: {channel_name}:{bu_name}; skipping.")
+                continue
+            train_df, valid_df = bu_df.iloc[:-VAL_LEN_6M], bu_df.iloc[-VAL_LEN_6M:]
+            y_val = valid_df['TotalCallsOffered']
 
-        # CWLB (short-horizon constraints; 1 can be used but capped; 3/6/12 must carry at least half combined)
-        cwlb_constraints = {
-            1: {'max': 0.5},
-            3: {'min': 0.2},
-            'combined': [{'lags': [3, 6, 12], 'min': 0.5}]
-        }
-        cwlb_weights, cwlb_smape, _ = find_best_weights(
-            bu_ts, [1, 3, 6, 12], cwlb_constraints, VAL_LEN_6M, GRID_STEP
-        )
-        cwlb_smape_str = f"{cwlb_smape:.2f}" if np.isfinite(cwlb_smape) else "N/A"
-        logger.info(f"  -> CWLB evaluated: SMAPE={cwlb_smape_str}")
+            # WLB constraints
+            # Phone keeps earlier CWLB settings; Chat uses WLB (no lag12) with similar idea:
+            #   - cap lag1 to 0.5
+            #   - enforce some minimum share on longer lags
+            if channel_name == 'Phone' and use_cw_for_phone:
+                lags_for_wlb = [1,3,6,12]
+                constraints = {1:{'max':0.5}, 3:{'min':0.2}, 'combined':[{'lags':[3,6,12], 'min':0.5}]}
+            else:
+                lags_for_wlb = target_lags  # Chat: [1,3,6]
+                constraints = {1:{'max':0.5}, 3:{'min':0.25}, 'combined':[{'lags':[3,6], 'min':0.5}]}
 
-        # XGBoost training (log-space target)
-        X_train = train_df[xgb_features]
-        y_train = train_df['TotalCallsOffered']
-        X_val   = valid_df[xgb_features]
+            bu_ts = bu_df['TotalCallsOffered'].asfreq('MS')
+            wlb_weights, wlb_smape, _ = find_best_weights(
+                bu_ts, lags_for_wlb, constraints, VAL_LEN_6M, GRID_STEP
+            )
+            wlb_smape_str = f"{wlb_smape:.2f}" if np.isfinite(wlb_smape) else "N/A"
+            wlb_label = 'CWLB' if (channel_name == 'Phone' and use_cw_for_phone) else 'WLB'
+            logger.info(f"  -> {wlb_label} evaluated: SMAPE={wlb_smape_str}")
 
-        xgb = XGBRegressor(objective="reg:squarederror",
-                           n_estimators=100,
-                           learning_rate=0.05,
-                           max_depth=3,
-                           random_state=42)
-        xgb.fit(X_train, np.log1p(y_train))
-        xgb_preds = safe_expm1(xgb.predict(X_val))
-        xgb_smape = smape(y_val, xgb_preds)
-        logger.info(f"  -> XGBoost evaluated: SMAPE={xgb_smape:.2f}")
+            # XGB
+            X_train = train_df[xgb_features]
+            y_train = train_df['TotalCallsOffered']
+            X_val   = valid_df[xgb_features]
 
-        # Store feature importances (cast to native types)
-        imp = {str(feat): float(score) for feat, score in zip(xgb.feature_names_in_, xgb.feature_importances_)}
-        xgb_imp_rows.append({'bu': bu_name, 'feature_importance': json.dumps(to_native(imp))})
+            xgb = XGBRegressor(objective="reg:squarederror",
+                               n_estimators=100,
+                               learning_rate=0.05,
+                               max_depth=3,
+                               random_state=42)
+            xgb.fit(X_train, np.log1p(y_train))
+            xgb_preds = safe_expm1(xgb.predict(X_val))
+            xgb_smape = smape(y_val, xgb_preds)
+            logger.info(f"  -> XGBoost evaluated: SMAPE={xgb_smape:.2f}")
 
-        # Winner selection; compute long-horizon CWLB weights if CWLB wins
-        if cwlb_smape <= xgb_smape:
-            # Ensure weights are native for JSON later
-            winner_details = {int(k): float(v) for k, v in (cwlb_weights or {}).items()}
-            winner, winner_smape = 'CWLB', cwlb_smape
-            long_constraints = {3: {'min': 0.4}, 6: {'min': 0.2}, 12: {'min': 0.1}}
-            long_weights, _, _ = find_best_weights(bu_ts, [3, 6, 12], long_constraints, 12, GRID_STEP)
-        else:
-            winner_details = {'n_estimators': 100, 'lr': 0.05, 'max_depth': 3}
-            winner, winner_smape = 'XGBoost', xgb_smape
-            long_weights = None
+            # Feature importances
+            imp = {str(feat): float(score) for feat, score in zip(xgb.feature_names_in_, xgb.feature_importances_)}
+            xgb_imp_rows.append({'bu': f"{channel_name}:{bu_name}", 'feature_importance': json.dumps(to_native(imp))})
 
-        logger.info(f"✓ WINNER for {bu_name}: {winner} (SMAPE: {winner_smape:.2f})")
-        audit_rows.append({
-            'bu': bu_name,
-            'winner': winner,
-            'winner_smape': float(winner_smape) if np.isfinite(winner_smape) else None,
-            'cwlb_smape': float(cwlb_smape) if np.isfinite(cwlb_smape) else None,
-            'xgb_smape': float(xgb_smape) if np.isfinite(xgb_smape) else None,
-            'details': json.dumps(to_native(winner_details))
-        })
-
-        # 5) Forecast generation
-        if np.isfinite(winner_smape):
-            logger.info(f"Generating {FORECAST_HORIZON}-month forecast with {winner}...")
-            hist = deque(bu_ts.tolist(), maxlen=24)
-
-            # Econ history used to form "future" lag features by re-using last known lags
-            fred_hist_df = bu_df[[c for c in ECONOMIC_FEATURES if c in bu_df.columns]].copy()
-            future_idx = pd.date_range(bu_ts.index[-1], periods=FORECAST_HORIZON + 1, freq='MS')[1:]
-
-            for i, d in enumerate(future_idx, 1):
-                pred = np.nan
-                if winner == 'CWLB' and cwlb_weights:
-                    if long_weights is None:
-                        # Fallback: use CWLB weights throughout if long-weights missing
-                        if i == 1:
-                            lags_to_use = {1: hist[-1], 3: hist[-3], 6: hist[-6], 12: hist[-12]}
-                        elif i in [2, 3]:
-                            # approximate early steps
-                            lags_to_use = {3: hist[-3], 6: hist[-6], 12: hist[-12]}
-                        else:
-                            lags_to_use = {3: hist[-3], 6: hist[-6], 12: hist[-12]}
-                        pred = sum(cwlb_weights.get(l, 0.0) * v for l, v in lags_to_use.items())
-                    else:
-                        if i == 1:
-                            w, lags_to_use = cwlb_weights, {1: hist[-1], 3: hist[-3], 6: hist[-6], 12: hist[-12]}
-                        elif i in [2, 3]:
-                            w, lags_to_use = cwlb_weights, {3: hist[-3], 6: hist[-6], 12: hist[-12]}
-                        else:
-                            w, lags_to_use = long_weights, {3: hist[-3], 6: hist[-6], 12: hist[-12]}
-                        pred = sum(w.get(lag, 0.0) * value for lag, value in lags_to_use.items())
-
-                elif winner == 'XGBoost':
-                    # Build one-row feature frame for time d
-                    row = {
-                        'trend': (train_df['trend'].max() or 0) + len(valid_df) + i,
-                        'sin_month': np.sin(2*np.pi*d.month/12),
-                        'cos_month': np.cos(2*np.pi*d.month/12),
-                        'lag_3': hist[-3] if len(hist) >= 3 else hist[-1],
-                        'lag_6': hist[-6] if len(hist) >= 6 else hist[-1],
-                        'lag_12': hist[-12] if len(hist) >= 12 else hist[-1],
-                    }
-                    for col in ECONOMIC_FEATURES:
-                        for lag in [3, 6, 12]:
-                            key = f'{col}_lag_{lag}'
-                            if key in xgb_features:
-                                # Reuse last known lagged econ level
-                                row[key] = bu_df[col].iloc[-lag] if col in bu_df.columns and len(bu_df[col]) >= lag else np.nan
-
-                    x_row_df = pd.DataFrame([row])[xgb_features]
-                    pred = safe_expm1(xgb.predict(x_row_df)[0])
+            # Winner selection + long-horizon weights for WLB winner
+            if wlb_smape <= xgb_smape:
+                winner, winner_smape = wlb_label, wlb_smape
+                winner_details = {int(k): float(v) for k, v in (wlb_weights or {}).items()}
+                if channel_name == 'Phone' and use_cw_for_phone:
+                    long_lags = [3,6,12]
+                    long_constraints = {3:{'min':0.4}, 6:{'min':0.2}, 12:{'min':0.1}}
                 else:
-                    # Fallback to last value (should rarely happen)
-                    pred = hist[-1]
+                    long_lags = [3,6]
+                    long_constraints = {3:{'min':0.4}, 6:{'min':0.2}}
+                long_weights, _, _ = find_best_weights(bu_ts, long_lags, long_constraints, 12, GRID_STEP)
+            else:
+                winner, winner_smape = 'XGBoost', xgb_smape
+                winner_details = {'n_estimators': 100, 'lr': 0.05, 'max_depth': 3}
+                long_weights = None
 
-                hist.append(pred)
-                forecasts.append({
-                    'fx_date': d,
-                    'client_id': bu_name,
-                    'vol_type': f'phone_{winner.lower()}',
-                    'fx_vol': safe_round(pred),
-                    'fx_id': f"{winner.lower()}_phone_{STAMP:%Y%m%d}",
-                    'fx_status': "A",
-                    'load_ts': STAMP
-                })
+            logger.info(f"✓ WINNER for {channel_name}:{bu_name}: {winner} (SMAPE: {winner_smape:.2f})")
+            audit_rows.append({
+                'channel': channel_name,
+                'bu': bu_name,
+                'winner': winner,
+                'winner_smape': float(winner_smape) if np.isfinite(winner_smape) else None,
+                f'{wlb_label.lower()}_smape': float(wlb_smape) if np.isfinite(wlb_smape) else None,
+                'xgb_smape': float(xgb_smape) if np.isfinite(xgb_smape) else None,
+                'details': json.dumps(to_native(winner_details))
+            })
+
+            # 5) Forecast generation
+            if np.isfinite(winner_smape):
+                logger.info(f"Generating {FORECAST_HORIZON}-month forecast with {winner}...")
+                hist = deque(bu_ts.tolist(), maxlen=24)
+                future_idx = pd.date_range(bu_ts.index[-1], periods=FORECAST_HORIZON + 1, freq='MS')[1:]
+
+                for i, d in enumerate(future_idx, 1):
+                    pred = np.nan
+                    if winner in ('WLB', 'CWLB') and wlb_weights:
+                        # early steps may use the short-horizon weights; later, long_weights if available
+                        if long_weights is None:
+                            # fallback: keep short weights
+                            # map requested lags to available history safely
+                            lags_to_use = {}
+                            for L in sorted(set(lags_for_wlb)):
+                                if len(hist) >= L:
+                                    lags_to_use[L] = hist[-L]
+                            pred = sum((wlb_weights.get(L, 0.0) * lags_to_use[L]) for L in lags_to_use)
+                        else:
+                            if i in [1,2] and 1 in lags_for_wlb:
+                                # allow lag1 only in very first step if available
+                                lags_to_use = {}
+                                for L in sorted(set(lags_for_wlb)):
+                                    if len(hist) >= L:
+                                        lags_to_use[L] = hist[-L]
+                                use_w = wlb_weights
+                            else:
+                                # switch to long-horizon set
+                                lags_to_use = {}
+                                for L in sorted(set(long_weights.keys())):
+                                    if len(hist) >= L:
+                                        lags_to_use[L] = hist[-L]
+                                use_w = long_weights
+                            pred = sum((use_w.get(L, 0.0) * lags_to_use[L]) for L in lags_to_use)
+
+                    elif winner == 'XGBoost':
+                        # Single-row feature vector
+                        row = {
+                            'trend': (train_df['trend'].max() or 0) + len(valid_df) + i,
+                            'sin_month': np.sin(2*np.pi*d.month/12),
+                            'cos_month': np.cos(2*np.pi*d.month/12),
+                        }
+                        # target lags
+                        for L in target_lags:
+                            row[f'lag_{L}'] = hist[-L] if len(hist) >= L else hist[-1]
+                        # econ lags (reuse last known lags)
+                        for c in ECONOMIC_FEATURES:
+                            for l in [3,6,12]:
+                                key = f'{c}_lag_{l}'
+                                if key in xgb_features:
+                                    # Use last known level for that lag; if not available, NaN (XGB will still output)
+                                    if key in bu_df.columns and not bu_df[key].dropna().empty:
+                                        row[key] = bu_df[key].dropna().iloc[-1]
+                                    else:
+                                        row[key] = np.nan
+
+                        x_row_df = pd.DataFrame([row])[xgb_features]
+                        pred = safe_expm1(xgb.predict(x_row_df)[0])
+                    else:
+                        pred = hist[-1]
+
+                    hist.append(pred)
+                    forecasts.append({
+                        'fx_date': d,
+                        'client_id': bu_name,
+                        'vol_type': f"{channel_name.lower()}_{winner.lower()}",
+                        'fx_vol': safe_round(pred),
+                        'fx_id': f"{winner.lower()}_{channel_name.lower()}_{STAMP:%Y%m%d}",
+                        'fx_status': "A",
+                        'load_ts': STAMP
+                    })
+
+    # ------------------- run both channels -------------------
+    run_channel(channel_name='Phone', target_lags=[1,3,6,12], use_cw_for_phone=True)
+    run_channel(channel_name='Chat',  target_lags=[1,3,6],     use_cw_for_phone=False)
 
     # 6) Save All Local Deliverables and (optionally) Push to GBQ
     if audit_rows:
@@ -436,7 +462,8 @@ try:
         # dedup_sql = f"""
         # UPDATE `{DEST_TABLE}` t
         # SET t.fx_status = 'I'
-        # WHERE t.fx_status = 'A' AND t.vol_type LIKE 'phone_%'
+        # WHERE t.fx_status = 'A' AND t.vol_type IN ('phone_wlb','phone_cwlb','phone_xgboost',
+        #                                            'chat_wlb','chat_xgboost')
         #   AND t.client_id IN ({client_list_str})
         #   AND EXISTS (
         #     SELECT 1 FROM `{DEST_TABLE}` s
@@ -447,7 +474,7 @@ try:
         #   )
         # """
         # bigquery_manager.run_gbq_sql(dedup_sql, return_dataframe=False)
-        # logger.info("✓ Older phone forecasts deactivated in GBQ.")
+        # logger.info("✓ Older forecasts deactivated in GBQ for overlapping rows.")
         #
         # bigquery_manager.update_log_in_bigquery()
         # logger.info("✓ Forecasting complete and results pushed to BigQuery.")
@@ -457,4 +484,4 @@ try:
         logger.warning("No forecasts were generated.")
 
 except Exception as exc:
-    email_manager.handle_error("Credit Phone Production Script Failure", exc, is_test=True)
+    email_manager.handle_error("Credit Forecast Script Failure", exc, is_test=True)
