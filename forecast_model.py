@@ -1,16 +1,18 @@
 """
-CX Credit - Call Volume Forecast - Production Hybrid v2.7
+CX Credit - Call Volume Forecast - Production Hybrid v2.8
 
 - vol_type strictly 'phone' or 'chat'
 - PHONE: CWLB vs XGB vs Native3mGR; winner by 6m SMAPE; recursive forecast
 - CHAT : WLB with lags {1,3} only; weights learned on LAST 3 MONTHS (3m SMAPE);
          recursive forecast using those fixed weights
+- GBQ push: enforces one row per (client_id, vol_type, fx_date) in this run,
+            and deactivates older rows across legacy vol_type suffixes
+            (e.g., phone_cwlb, chat_xgboost) for same BU+month+channel.
 
 Hardening:
- - Pearson numeric coercion + guards
+ - Numeric coercion/guards for stats & SMAPE
  - Safe JSON serialization (NumPy -> Python native)
- - Safe logging for SMAPE values
- - GBQ push enabled with dedup of older rows
+ - Robust GBQ dedup using base channel via REGEXP_EXTRACT
 """
 
 # ------------------- standard imports -----------------------
@@ -112,29 +114,23 @@ def find_best_weights(ts: pd.Series, lags: list, constraints: dict, val_window_l
         valid = True
         for lag, limits in constraints.items():
             if isinstance(lag, int) and lag in weights:
-                if 'max' in limits and weights[lag] > limits['max'] + 1e-9:
-                    valid = False; break
-                if 'min' in limits and weights[lag] < limits['min'] - 1e-9:
-                    valid = False; break
-        if not valid:
-            continue
+                if 'max' in limits and weights[lag] > limits['max'] + 1e-9: valid = False; break
+                if 'min' in limits and weights[lag] < limits['min'] - 1e-9: valid = False; break
+        if not valid: continue
 
         # Combined constraints (optional)
         if 'combined' in constraints:
             for combo in constraints['combined']:
                 combo_sum = sum(weights.get(l, 0.0) for l in combo['lags'])
-                if 'min' in combo and combo_sum < combo['min'] - 1e-9:
-                    valid = False; break
-            if not valid:
-                continue
+                if 'min' in combo and combo_sum < combo['min'] - 1e-9: valid = False; break
+            if not valid: continue
 
         forecast_vals = 0.0
         for lag, w in weights.items():
             forecast_vals += ts.shift(lag).reindex(validation_data.index) * w
 
         mask = forecast_vals.notna() & validation_data.notna()
-        if not mask.any():
-            continue
+        if not mask.any(): continue
 
         current_smape = smape(validation_data[mask], forecast_vals[mask])
         if current_smape < best_smape - 0.1:
@@ -199,7 +195,7 @@ def seasonal_naive_3m_gr_predict(train_series: pd.Series, pred_index: pd.Datetim
 
 # ------------------- MAIN EXECUTION -------------------------
 try:
-    logger.info("Starting Credit Forecasting v2.7 (Phone + Chat)...")
+    logger.info("Starting Credit Forecasting v2.8 (Phone + Chat)...")
 
     # 1) Fetch & Prepare Data
     source_df = bigquery_manager.run_gbq_sql(SQL_QUERY_PATH, return_dataframe=True)
@@ -425,9 +421,15 @@ try:
     with open(MODEL_SUMMARIES_FILE, 'w') as f:
         f.write("No statsmodels summaries generated in this script version.\n")
 
-    # 7) Write forecasts locally and PUSH to GBQ (enabled)
+    # 7) Write forecasts locally and PUSH to GBQ (with strict uniqueness per BU-month-channel)
     if forecasts:
-        fx_df = pd.DataFrame(forecasts).sort_values(['client_id', 'fx_date'])
+        fx_df = pd.DataFrame(forecasts)
+
+        # Enforce one row per (client_id, vol_type, fx_date) in this batch
+        fx_df = fx_df.sort_values(['client_id','vol_type','fx_date','load_ts']) \
+                     .drop_duplicates(subset=['client_id','vol_type','fx_date'], keep='last')
+
+        fx_df = fx_df.sort_values(['client_id', 'vol_type', 'fx_date'])
         fx_df.to_csv(FORECAST_RESULTS_CSV, index=False)
         logger.info(f"✓ Forecast data saved locally to {FORECAST_RESULTS_CSV}")
 
@@ -437,8 +439,11 @@ try:
             fx_df, DEST_TABLE, gbq_insert_action="append", auto_convert_df=True
         )
 
-        # Deactivate older rows where a newer load_ts exists for same (client_id, vol_type, fx_date)
+        # Deactivate older rows for the same BU+month+channel (covers legacy vol_type suffixes)
         client_list = fx_df['client_id'].dropna().unique().tolist()
+        date_min = fx_df['fx_date'].min().date()
+        date_max = fx_df['fx_date'].max().date()
+
         if client_list:
             client_list_str = ", ".join([f"'{c}'" for c in client_list])
             dedup_sql = f"""
@@ -446,17 +451,20 @@ try:
             SET t.fx_status = 'I'
             WHERE t.fx_status = 'A'
               AND t.client_id IN ({client_list_str})
+              AND t.fx_date BETWEEN DATE('{date_min}') AND DATE('{date_max}')
               AND EXISTS (
-                SELECT 1 FROM `{DEST_TABLE}` s
+                SELECT 1
+                FROM `{DEST_TABLE}` s
                 WHERE s.client_id = t.client_id
-                  AND s.vol_type = t.vol_type
                   AND s.fx_date = t.fx_date
+                  -- same channel (phone/chat) regardless of historical suffixes
+                  AND REGEXP_EXTRACT(s.vol_type, r'^(phone|chat)') = REGEXP_EXTRACT(t.vol_type, r'^(phone|chat)')
                   AND s.load_ts > t.load_ts
               )
             """
             bigquery_manager.run_gbq_sql(dedup_sql, return_dataframe=False)
             bigquery_manager.update_log_in_bigquery()
-            logger.info("✓ Forecasts pushed to GBQ and older active rows deactivated.")
+            logger.info("✓ Forecasts pushed to GBQ and older active rows deactivated (per BU-month-channel).")
         else:
             logger.warning("Client list empty after forecast build; skipped dedup SQL.")
 
