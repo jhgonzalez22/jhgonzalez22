@@ -1,15 +1,16 @@
 """
-CX Credit - Call Volume Forecast - Production Hybrid v2.6
+CX Credit - Call Volume Forecast - Production Hybrid v2.7
 
 - vol_type strictly 'phone' or 'chat'
 - PHONE: CWLB vs XGB vs Native3mGR; winner by 6m SMAPE; recursive forecast
-- CHAT : WLB with lags {1,3} only; weights learned on validation (6m SMAPE);
+- CHAT : WLB with lags {1,3} only; weights learned on LAST 3 MONTHS (3m SMAPE);
          recursive forecast using those fixed weights
 
 Hardening:
  - Pearson numeric coercion + guards
  - Safe JSON serialization (NumPy -> Python native)
  - Safe logging for SMAPE values
+ - GBQ push enabled with dedup of older rows
 """
 
 # ------------------- standard imports -----------------------
@@ -62,7 +63,8 @@ MODEL_SUMMARIES_FILE = r"C:\WFM_Scripting\model_summaries_credit.txt"
 
 # ------------------- forecast parameters --------------------
 FORECAST_HORIZON   = 12
-VAL_LEN_6M         = 6
+VAL_LEN_PHONE_6M   = 6
+VAL_LEN_CHAT_3M    = 3
 STAMP              = datetime.now(pytz.timezone("America/Chicago"))
 GRID_STEP          = 0.05
 ECONOMIC_FEATURES  = ['UNRATE', 'HSN1F', 'FEDFUNDS', 'MORTGAGE30US']
@@ -197,7 +199,7 @@ def seasonal_naive_3m_gr_predict(train_series: pd.Series, pred_index: pd.Datetim
 
 # ------------------- MAIN EXECUTION -------------------------
 try:
-    logger.info("Starting Credit Forecasting v2.6 (Phone + Chat)...")
+    logger.info("Starting Credit Forecasting v2.7 (Phone + Chat)...")
 
     # 1) Fetch & Prepare Data
     source_df = bigquery_manager.run_gbq_sql(SQL_QUERY_PATH, return_dataframe=True)
@@ -206,7 +208,7 @@ try:
     source_df['TotalCallsOffered'] = pd.to_numeric(source_df['TotalCallsOffered'], errors='coerce')
     df = source_df[['date', 'bu', 'VolumeType', 'TotalCallsOffered']].drop_duplicates().sort_values(['bu', 'date'])
 
-    # 2) Economic Data (still merged; used by Phone/XGB)
+    # 2) Economic Data (used by Phone/XGB)
     fred_df = bigquery_manager.run_gbq_sql(FRED_GBQ_QUERY, return_dataframe=True)
     lagged_econ_cols = []
     if not fred_df.empty:
@@ -260,16 +262,16 @@ try:
                     [c for c in [f'{x}_lag_{l}' for x in ECONOMIC_FEATURES for l in [3,6,12]] if c in bu.columns]
 
         stat_test_results.append(perform_statistical_tests(bu, f"Phone:{bu_name}", xgb_feats))
-        if len(bu) <= VAL_LEN_6M:
+        if len(bu) <= VAL_LEN_PHONE_6M:
             logger.warning(f"  Not enough data for 6m validation: Phone:{bu_name}; skipping.")
             continue
-        train, valid = bu.iloc[:-VAL_LEN_6M], bu.iloc[-VAL_LEN_6M:]
+        train, valid = bu.iloc[:-VAL_LEN_PHONE_6M], bu.iloc[-VAL_LEN_PHONE_6M:]
         y_val = valid['TotalCallsOffered']
 
         # CWLB
         cwlb_weights, cwlb_smape, _ = find_best_weights(
             bu_ts, [1,3,6,12], {1:{'max':0.5}, 3:{'min':0.2}, 'combined':[{'lags':[3,6,12], 'min':0.5}]},
-            VAL_LEN_6M, GRID_STEP
+            VAL_LEN_PHONE_6M, GRID_STEP
         )
         logger.info(f"  -> CWLB SMAPE={f'{cwlb_smape:.2f}' if np.isfinite(cwlb_smape) else 'N/A'}")
 
@@ -352,11 +354,9 @@ try:
                     'fx_status': "A", 'load_ts': STAMP
                 })
 
-    # -------- CHAT: WLB (lags {1,3}) ONLY; learn weights; recursive forecast ----------
-    logger.info("\n" + "="*60 + "\nProcessing Channel: Chat (WLB lag1,lag3 only)\n" + "="*60)
+    # -------- CHAT: WLB (lags {1,3}) ONLY; learn weights on 3m; recursive forecast ----------
+    logger.info("\n" + "="*60 + "\nProcessing Channel: Chat (WLB lag1,lag3; 3m SMAPE)\n" + "="*60)
     chat_df = df[df['VolumeType'] == 'Chat'].copy()
-    # Need lag_3 present at least to start recursive forecasting
-    chat_df.dropna(subset=[c for c in ['lag_3'] if c in chat_df.columns], inplace=True)
 
     for bu_name in chat_df['bu'].unique():
         logger.info(f"\n--- Chat :: BU: {bu_name} ---")
@@ -365,24 +365,22 @@ try:
         bu_ts = bu['TotalCallsOffered'].asfreq('MS')
         all_modeling_data.append(bu.copy())
 
-        # Stats (basic — just on available features)
-        xgb_feats_placeholder = ['lag_1','lag_3']
-        stat_test_results.append(perform_statistical_tests(bu, f"Chat:{bu_name}", [f for f in xgb_feats_placeholder if f in bu.columns]))
+        # Simple stats
+        stat_test_results.append(perform_statistical_tests(bu, f"Chat:{bu_name}", [c for c in ['lag_1','lag_3'] if c in bu.columns]))
 
-        if len(bu) <= VAL_LEN_6M:
-            logger.warning(f"  Not enough data for 6m validation: Chat:{bu_name}; skipping.")
+        if len(bu) <= VAL_LEN_CHAT_3M:
+            logger.warning(f"  Not enough data for 3m validation: Chat:{bu_name}; skipping.")
             continue
 
-        # Learn dynamic weights on {1,3} via validation SMAPE
-        train, valid = bu.iloc[:-VAL_LEN_6M], bu.iloc[-VAL_LEN_6M:]
+        # Learn dynamic weights on {1,3} via 3-month validation SMAPE
+        train, valid = bu.iloc[:-VAL_LEN_CHAT_3M], bu.iloc[-VAL_LEN_CHAT_3M:]
         wlb_weights, wlb_smape, _ = find_best_weights(
-            bu_ts, [1,3], constraints={}, val_window_len=VAL_LEN_6M, step=GRID_STEP
+            bu_ts, [1,3], constraints={}, val_window_len=VAL_LEN_CHAT_3M, step=GRID_STEP
         )
-        wstr = f"{wlb_weights}" if wlb_weights else "{}"
-        logger.info(f"  -> Chat WLB(1,3) SMAPE={f'{wlb_smape:.2f}' if np.isfinite(wlb_smape) else 'N/A'} weights={wstr}")
+        logger.info(f"  -> Chat WLB(1,3) 3m SMAPE={f'{wlb_smape:.2f}' if np.isfinite(wlb_smape) else 'N/A'} weights={wlb_weights}")
 
         audit_rows.append({
-            'channel': 'Chat', 'bu': bu_name, 'winner': 'WLB(1,3)',
+            'channel': 'Chat', 'bu': bu_name, 'winner': 'WLB(1,3)-3m',
             'winner_smape': float(wlb_smape) if np.isfinite(wlb_smape) else None,
             'details': json.dumps(to_native({'weights': wlb_weights}))
         })
@@ -401,7 +399,7 @@ try:
                 hist.append(pred)
                 forecasts.append({
                     'fx_date': d, 'client_id': bu_name, 'vol_type': 'chat',
-                    'fx_vol': safe_round(pred), 'fx_id': f"wlb13_chat_{STAMP:%Y%m%d}",
+                    'fx_vol': safe_round(pred), 'fx_id': f"wlb13_3m_chat_{STAMP:%Y%m%d}",
                     'fx_status': "A", 'load_ts': STAMP
                 })
         else:
@@ -427,32 +425,43 @@ try:
     with open(MODEL_SUMMARIES_FILE, 'w') as f:
         f.write("No statsmodels summaries generated in this script version.\n")
 
+    # 7) Write forecasts locally and PUSH to GBQ (enabled)
     if forecasts:
         fx_df = pd.DataFrame(forecasts).sort_values(['client_id', 'fx_date'])
         fx_df.to_csv(FORECAST_RESULTS_CSV, index=False)
         logger.info(f"✓ Forecast data saved locally to {FORECAST_RESULTS_CSV}")
 
-        logger.warning("GBQ PUSH IS DISABLED FOR TESTING. No data was written to the database.")
-        # --- Enable when ready ---
-        # bigquery_manager.import_data_to_bigquery(fx_df, DEST_TABLE, gbq_insert_action="append", auto_convert_df=True)
-        # client_list_str = ", ".join([f"'{c}'" for c in fx_df['client_id'].unique()])
-        # dedup_sql = f"""
-        # UPDATE `{DEST_TABLE}` t
-        # SET t.fx_status = 'I'
-        # WHERE t.fx_status = 'A'
-        #   AND t.client_id IN ({client_list_str})
-        #   AND EXISTS (
-        #     SELECT 1 FROM `{DEST_TABLE}` s
-        #     WHERE s.client_id = t.client_id
-        #       AND s.vol_type = t.vol_type
-        #       AND s.fx_date = t.fx_date
-        #       AND s.load_ts > t.load_ts
-        #   )"""
-        # bigquery_manager.run_gbq_sql(dedup_sql, return_dataframe=False)
-        # bigquery_manager.update_log_in_bigquery()
+        # --- GBQ PUSH ---
+        logger.info(f"Pushing {len(fx_df):,} forecast rows to {DEST_TABLE}...")
+        bigquery_manager.import_data_to_bigquery(
+            fx_df, DEST_TABLE, gbq_insert_action="append", auto_convert_df=True
+        )
+
+        # Deactivate older rows where a newer load_ts exists for same (client_id, vol_type, fx_date)
+        client_list = fx_df['client_id'].dropna().unique().tolist()
+        if client_list:
+            client_list_str = ", ".join([f"'{c}'" for c in client_list])
+            dedup_sql = f"""
+            UPDATE `{DEST_TABLE}` t
+            SET t.fx_status = 'I'
+            WHERE t.fx_status = 'A'
+              AND t.client_id IN ({client_list_str})
+              AND EXISTS (
+                SELECT 1 FROM `{DEST_TABLE}` s
+                WHERE s.client_id = t.client_id
+                  AND s.vol_type = t.vol_type
+                  AND s.fx_date = t.fx_date
+                  AND s.load_ts > t.load_ts
+              )
+            """
+            bigquery_manager.run_gbq_sql(dedup_sql, return_dataframe=False)
+            bigquery_manager.update_log_in_bigquery()
+            logger.info("✓ Forecasts pushed to GBQ and older active rows deactivated.")
+        else:
+            logger.warning("Client list empty after forecast build; skipped dedup SQL.")
 
     else:
-        logger.warning("No forecasts were generated.")
+        logger.warning("No forecasts were generated; nothing to push.")
 
 except Exception as exc:
     email_manager.handle_error("Credit Forecast Script Failure", exc, is_test=True)
