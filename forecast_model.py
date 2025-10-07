@@ -1,24 +1,12 @@
 """
-Credit Tickets - Monthly Volume Forecast — v1.18 (Blend+DriverLags, Collinearity & DF Guardrails)
+CX Credit - Call Volume Forecast - Production Hybrid (CWLB vs. XGB w/ GBQ FRED) v2.3
 
-What’s new vs v1.17.3:
-  • New models added to the competition for BOTH clients:
-      - WeightedLagBlend         (WLBl: target-only lag blend on {3,6,12})
-      - WeightedLagBlendDrv      (WLB + seasonal driver growth blend)
-      - Ridge_DriverLags         (Ridge on driver-lag features; log-target)
-      - OLS_DriverLags           (OLS on driver-lag features; log-target with guardrails)
-  • Existing models kept:
-      - XGBoost (log target)
-      - OLS_Auto_Market (Lasso feature select + guardrails)
-      - SeasonalNaive3mGR, SeasonalNaive3mDiffGR
-  • Collinearity & DF guardrails:
-      - prune_collinearity(|corr|>0.95) with priority-keep
-      - cap max feature count (ensure residual DF ≥ ~6)
-      - always add seasonal anchor if available (lag_12); for OLS_Auto_Market, force `trend` if only static market vars selected
-  • Robust inference:
-      - Build BOTH target lags and driver lags during recursion (k=1..12)
-      - Use driver FX when available; hold market vars at last known values
-      - Endog/exog to statsmodels as pure float arrays to avoid dtype errors
+This script forecasts monthly phone call volumes by benchmarking a Constrained
+Weighted Lag Blend (CWLB) model against an XGBoost model with economic features.
+It is designed to generate a new forecast and push it to BigQuery every month it runs.
+
+v2.3 Fix: Corrected a data type issue in the perform_statistical_tests function
+by explicitly coercing data to numeric before correlation calculation.
 """
 
 # ------------------- standard imports -----------------------
@@ -29,57 +17,59 @@ import pytz
 import json
 from datetime import datetime
 from collections import deque
+import itertools
 
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm
-from sklearn.metrics import mean_squared_error
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LassoCV, RidgeCV
 from xgboost import XGBRegressor
 from statsmodels.tsa.stattools import adfuller
+from scipy.stats import pearsonr
 
 warnings.filterwarnings("ignore")
-np.seterr(all="ignore")
 
 # ------------------- helper-package path --------------------
 sys.path.append(r"C:\WFM_Scripting\Automation")
 from scripthelper import Config, Logger, BigQueryManager, EmailManager
 
 # ------------------- initialise scripthelper ---------------
-config           = Config(rpt_id=198)
+config           = Config(rpt_id=299)
 logger           = Logger(config)
 email_manager    = EmailManager(config)
 bigquery_manager = BigQueryManager(config)
 
-# ------------------- file / table paths --------------------
-LOCAL_CSV          = r"C:\WFM_Scripting\credit_ticket_forecast_results.csv"
-AUDIT_CSV          = r"C:\WFM_Scripting\credit_ticket_model_eval_debug.csv"
-MODELING_DATA_CSV  = r"C:\WFM_Scripting\credit_ticket_modeling_data.csv"
-STATS_CSV          = r"C:\WFM_Scripting\credit_ticket_statistical_tests.csv"
-SUMMARIES_FILE     = r"C:\WFM_Scripting\credit_ticket_model_summaries.txt"
-XGB_VIZ_CSV        = r"C:\WFM_Scripting\credit_ticket_xgb_feature_importance.csv"
+# ------------------- file / table paths & queries --------------------
+SQL_QUERY_PATH = (r"C:\WFM_Scripting\Forecasting"
+                  r"\GBQ - Credit Historicals Phone - Chat Volumes.sql")
+
+FRED_GBQ_QUERY = """
+    SELECT DATE_TRUNC(Date, MONTH) as date,
+           AVG(UNRATE) as UNRATE,
+           AVG(HSN1F) as HSN1F,
+           AVG(FEDFUNDS) as FEDFUNDS,
+           AVG(MORTGAGE30US) as MORTGAGE30US
+    FROM tax_clnt_svcs.fred 
+    WHERE DATE_TRUNC(Date, MONTH) >= '2022-01-01' 
+      AND DATE_TRUNC(Date, MONTH) <= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 1 DAY)
+    GROUP BY 1 
+    ORDER BY 1
+"""
+
+DEST_TABLE           = "tax_clnt_svcs.cx_nontax_platforms_forecast"
+FORECAST_RESULTS_CSV = r"C:\WFM_Scripting\forecast_results_credit.csv"
+MODEL_EVAL_CSV       = r"C:\WFM_Scripting\model_eval_credit.csv"
+MODELING_DATA_CSV    = r"C:\WFM_Scripting\modeling_data_credit.csv"
+STATS_CSV            = r"C:\WFM_Scripting\statistical_tests_credit.csv"
+XGB_VIZ_CSV          = r"C:\WFM_Scripting\xgb_feature_importance_credit.csv"
+MODEL_SUMMARIES_FILE = r"C:\WFM_Scripting\model_summaries_credit.txt"
 
 # ------------------- forecast parameters --------------------
-FORECAST_HORIZON   = 15
-MAX_LAGS           = 12
+FORECAST_HORIZON   = 12
 VAL_LEN_6M         = 6
 STAMP              = datetime.now(pytz.timezone("America/Chicago"))
+GRID_STEP          = 0.05
+ECONOMIC_FEATURES  = ['UNRATE', 'HSN1F', 'FEDFUNDS', 'MORTGAGE30US']
 
-FX_ID_PREFIX = {
-    "XGBoost": "xgb_ticket",
-    "OLS_Auto_Market": "ols_auto_mkt_ticket",
-    "SeasonalNaive3mGR": "seasonal_naive3mgr_ticket",
-    "SeasonalNaive3mDiffGR": "seasonal_naive3mdiffgr_ticket",
-    "WeightedLagBlend": "wlb_ticket",
-    "WeightedLagBlendDrv": "wlbdrv_ticket",
-    "Ridge_DriverLags": "ridge_drv_ticket",
-    "OLS_DriverLags": "ols_drv_ticket"
-}
-
-MARKET_VARS = ['UNRATE', 'HSN1F', 'FEDFUNDS', 'MORTGAGE30US']
-
-# ------------------- metric & modeling helpers -------------------------
+# ------------------- functions -------------------------
 def smape(actual, forecast):
     actual, forecast = np.asarray(actual, dtype=float), np.asarray(forecast, dtype=float)
     denom = (np.abs(actual) + np.abs(forecast)) / 2.0
@@ -93,585 +83,245 @@ def safe_round(x):
 def safe_expm1(x, lo=-20.0, hi=20.0):
     arr = np.asarray(x, dtype=float)
     return np.expm1(np.clip(arr, lo, hi))
-
-# includes mape() definition
-def safe_reg_metrics(y_true, y_pred):
-    def mape(actual, forecast):
-        actual, forecast = np.asarray(actual, dtype=float), np.asarray(forecast, dtype=float)
-        denom = np.where(actual == 0, 1.0, np.abs(actual))
-        return np.mean(np.abs((actual - forecast) / denom)) * 100
-    if y_pred is None: return dict(smape=np.nan, mape=np.nan, rmse=np.nan)
-    y, p = np.asarray(y_true, dtype=float), np.asarray(y_pred, dtype=float)
-    mask = np.isfinite(y) & np.isfinite(p)
-    if not mask.any(): return dict(smape=np.nan, mape=np.nan, rmse=np.nan)
-    return dict(smape=smape(y[mask], p[mask]), mape=mape(y[mask], p[mask]), rmse=float(np.sqrt(mean_squared_error(y[mask], p[mask]))))
-
-def recent_3m_growth(ts: pd.Series, pos: int) -> float:
-    if pos < 6: return 0.0
-    cur3, prev3 = ts.iloc[pos-3:pos].values, ts.iloc[pos-6:pos-3].values
-    prev_mean = np.mean(prev3)
-    return (np.mean(cur3) / prev_mean - 1.0) if prev_mean > 0 else 0.0
-
-def prior_year_3m_growth(ts: pd.Series, pos: int) -> float:
-    if pos < 18: return 0.0
-    win_py, prev_py = ts.iloc[pos-15:pos-12].values, ts.iloc[pos-18:pos-15].values
-    prev_mean = np.mean(prev_py)
-    return (np.mean(win_py) / prev_mean - 1.0) if prev_mean > 0 else 0.0
-
-def perform_statistical_tests(group_data: pd.DataFrame, client_id: str):
-    results = {'client_id': client_id}
-    target_col = 'total_cases_opened'
-    adf_series = pd.to_numeric(group_data[target_col], errors='coerce').dropna()
-    if len(adf_series) > 3:
+    
+def find_best_weights(ts: pd.Series, lags: list, constraints: dict, val_window_len: int, step: float):
+    val_window_len = min(val_window_len, len(ts) // 2)
+    min_val_len = 3
+    if len(ts) < val_window_len + max(lags):
+        return None, np.inf, None
+    validation_data = ts.iloc[-val_window_len:]
+    if len(validation_data) < min_val_len:
+        return None, np.inf, None
+    best_weights, best_smape, best_preds = None, np.inf, None
+    num_lags = len(lags)
+    weight_iters = [np.arange(0, 1.0 + step, step) for _ in range(num_lags - 1)]
+    for W in itertools.product(*weight_iters):
+        if sum(W) > 1.0 + 1e-9: continue
+        all_w = list(W) + [1.0 - sum(W)]
+        weights = dict(zip(lags, all_w))
+        valid = True
+        for lag, limits in constraints.items():
+            if lag in weights:
+                if 'max' in limits and weights[lag] > limits['max'] + 1e-9: valid = False; break
+                if 'min' in limits and weights[lag] < limits['min'] - 1e-9: valid = False; break
+        if not valid: continue
+        if 'combined' in constraints:
+            for combo in constraints['combined']:
+                combo_sum = sum(weights.get(lag, 0) for lag in combo['lags'])
+                if 'min' in combo and combo_sum < combo['min'] - 1e-9: valid = False; break
+            if not valid: continue
+        forecast_vals = 0
+        for lag, w in weights.items():
+            forecast_vals += ts.shift(lag).reindex(validation_data.index) * w
+        mask = forecast_vals.notna() & validation_data.notna()
+        if not mask.any(): continue
+        current_smape = smape(validation_data[mask], forecast_vals[mask])
+        if current_smape < best_smape - 0.1:
+            best_smape, best_weights, best_preds = current_smape, weights, forecast_vals
+    return best_weights, best_smape, best_preds
+    
+def perform_statistical_tests(bu_data: pd.DataFrame, bu_name: str, features: list):
+    results = {'bu': bu_name}
+    target_col = 'TotalCallsOffered'
+    adf_series = bu_data[target_col].dropna()
+    if len(adf_series) > 12:
         adf_p = adfuller(adf_series)[1]
-        results['adf_p_value'], results['is_stationary'] = float(adf_p), bool(adf_p < 0.05)
+        results['adf_p_value'] = adf_p
+        results['is_stationary'] = adf_p < 0.05
+
+    correlations = {}
+    for col in features:
+        if col in bu_data.columns:
+            # --- FIX APPLIED HERE ---
+            # Ensure both series are numeric, coercing any errors to NaN
+            target = pd.to_numeric(bu_data[target_col], errors='coerce')
+            predictor = pd.to_numeric(bu_data[col], errors='coerce')
+            
+            mask = target.notna() & predictor.notna()
+            if mask.sum() > 2:
+                corr, p_val = pearsonr(target[mask], predictor[mask])
+                correlations[col] = {'correlation': corr, 'p_value': p_val}
+
+    results['correlations'] = json.dumps(correlations)
+    logger.info(f"  --- Statistical Tests for: {bu_name} ---")
+    if 'adf_p_value' in results:
+        logger.info(f"  ADF P-Value: {results['adf_p_value']:.4f} (Stationary: {results['is_stationary']})")
     return results
-
-# ---------- collinearity pruning (priority-keep) ----------
-def prune_collinearity(X_df: pd.DataFrame, keep_priority: list, thr: float = 0.95) -> list:
-    """
-    Greedy pruning: keep features in priority order; drop any new feature whose
-    absolute correlation with any kept feature exceeds `thr`.
-    """
-    if X_df.shape[1] <= 1:
-        return X_df.columns.tolist()
-
-    cols = X_df.columns.tolist()
-    prio = [c for c in keep_priority if c in cols]
-    rest = [c for c in cols if c not in prio]
-    rest_sorted = sorted(rest, key=lambda c: np.nanvar(X_df[c].values), reverse=True)
-    ordered = prio + rest_sorted
-
-    kept = []
-    Xc = X_df.dropna()
-    if Xc.shape[0] < 3:
-        return ordered[: min(6, len(ordered))]
-
-    corrM = Xc.corr(numeric_only=True).fillna(0.0)
-
-    for col in ordered:
-        if not kept:
-            kept.append(col)
-            continue
-        ok = True
-        for k in kept:
-            c = corrM.loc[k, col] if (k in corrM.index and col in corrM.columns) else 0.0
-            if np.abs(c) > thr:
-                ok = False
-                break
-        if ok:
-            kept.append(col)
-    return kept
-
-# --------- driver-growth (WeightedLagBlendDrv helper) ----------
-DRV_ALPHA_PROFILE = [0.50, 0.30, 0.20]
-def compute_driver_r_yoy_weighted(s: pd.Series, ref_months: pd.DatetimeIndex) -> float:
-    """
-    Weighted YoY growth using last 3 months vs prior-year same months with weights 0.5/0.3/0.2
-    """
-    w = DRV_ALPHA_PROFILE
-    rs = []
-    for t in ref_months:
-        num = sum(w[i] * s.get(t - pd.DateOffset(months=i+1), np.nan) for i in range(3))
-        den = sum(w[i] * s.get(t - pd.DateOffset(months=i+13), np.nan) for i in range(3))
-        if np.isfinite(num) and np.isfinite(den) and den != 0:
-            rs.append(num/den - 1.0)
-    return float(np.mean(rs)) if rs else np.nan
-
-# ------------------- data fetching -------------------------
-def fetch_market_data(bq: BigQueryManager) -> pd.DataFrame:
-    sql = """
-    SELECT DATE_TRUNC(Date, MONTH) as date,
-           AVG(UNRATE) as UNRATE,
-           AVG(HSN1F) as HSN1F,
-           AVG(FEDFUNDS) as FEDFUNDS,
-           AVG(MORTGAGE30US) as MORTGAGE30US
-    FROM tax_clnt_svcs.fred 
-    WHERE Date >= '2023-01-01'
-    GROUP BY 1 ORDER BY 1
-    """
-    df = bq.run_gbq_sql(sql, return_dataframe=True)
-    if df.empty: return pd.DataFrame()
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.sort_values('date').ffill()
-    for c in MARKET_VARS:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-    return df
-
-def fetch_credit_workload_drivers(bq: BigQueryManager) -> pd.DataFrame:
-    sql = """
-    SELECT MonthOfOrder AS date, TotalOrders
-    FROM tax_clnt_svcs.view_cx_nontax_platforms_workload_drivers
-    WHERE client_id = 'Credit'
-    """
-    df = bigquery_manager.run_gbq_sql(sql, return_dataframe=True)
-    if df.empty: return pd.DataFrame(columns=["date", "TotalOrders"])
-    df['date'] = pd.to_datetime(df['date'])
-    df['TotalOrders'] = pd.to_numeric(df['TotalOrders'], errors='coerce')
-    return df.groupby('date', as_index=False)['TotalOrders'].sum()
-
-def fetch_credit_driver_forecasts(bq: BigQueryManager) -> pd.DataFrame:
-    sql = """
-    SELECT fx_date AS date, fx_vol AS TotalOrders_fx
-    FROM tax_clnt_svcs.cx_nontax_platforms_workload_drivers_fx
-    WHERE fx_status = 'A' AND client_id = 'Credit'
-    """
-    df = bigquery_manager.run_gbq_sql(sql, return_dataframe=True)
-    if df.empty: return pd.DataFrame(columns=['date','TotalOrders_fx'])
-    df['date'] = pd.to_datetime(df['date'])
-    df['TotalOrders_fx'] = pd.to_numeric(df['TotalOrders_fx'], errors='coerce')
-    return df
 
 # ------------------- MAIN EXECUTION -------------------------
 try:
-    logger.info("Starting Credit Ticket Forecasting Script (v1.18)...")
+    logger.info("Starting Credit Phone Forecasting Script (v2.3 Monthly Push Test)...")
 
-    # Base tickets (monthly)
-    TICKET_QUERY = """
-    SELECT DATE_TRUNC(dt, MONTH) AS date,
-           client_id,
-           'tickets' AS vol_type,
-           SUM(cases_opened) AS total_cases_opened
-    FROM tax_clnt_svcs.view_nontax_agg
-    WHERE client_id IN ('Credit - Customer Support', 'Credit - Tech Support')
-    GROUP BY 1, 2, 3
-    ORDER BY 2, 1;
-    """
-    df = bigquery_manager.run_gbq_sql(TICKET_QUERY, return_dataframe=True)
-    if df.empty:
-        raise RuntimeError("BQ returned zero rows for tickets")
-    df['date'] = pd.to_datetime(df['date'])
-    df['total_cases_opened'] = pd.to_numeric(df['total_cases_opened'], errors='coerce')
+    # 1. Fetch & Prepare Data
+    source_df = bigquery_manager.run_gbq_sql(SQL_QUERY_PATH, return_dataframe=True)
+    source_df = source_df.rename(columns={'Month': 'date'})
+    source_df['date'] = pd.to_datetime(source_df['date'])
+    df = source_df[source_df['VolumeType'] == 'Phone'].sort_values(['bu', 'date']).copy()
+    df = df[['date', 'bu', 'TotalCallsOffered']].drop_duplicates()
 
-    # Market & drivers
-    market_df = fetch_market_data(bigquery_manager)
-    drv_df    = fetch_credit_workload_drivers(bigquery_manager)
-    drv_fx_df = fetch_credit_driver_forecasts(bigquery_manager)
+    # 2. Integrate Economic Data from GBQ
+    logger.info("Fetching economic data from BigQuery...")
+    fred_df = bigquery_manager.run_gbq_sql(FRED_GBQ_QUERY, return_dataframe=True)
+    if not fred_df.empty:
+        fred_df['date'] = pd.to_datetime(fred_df['date'])
+        for col in ECONOMIC_FEATURES:
+            for lag in [3, 6, 12]:
+                fred_df[f'{col}_lag_{lag}'] = fred_df[col].shift(lag)
+        df = pd.merge(df, fred_df, on='date', how='left')
 
-    if not market_df.empty: df = pd.merge(df, market_df, on='date', how='left')
-    if not drv_df.empty:    df = pd.merge(df, drv_df,    on='date', how='left')
+    # 3. Engineer Other Features
+    df['month'] = df['date'].dt.month
+    df['sin_month'] = np.sin(2 * np.pi * df['month'] / 12)
+    df['cos_month'] = np.cos(2 * np.pi * df['month'] / 12)
+    df['trend'] = df.groupby('bu').cumcount() + 1
+    for lag in [1, 2, 3, 6, 12]:
+        df[f'lag_{lag}'] = df.groupby('bu')['TotalCallsOffered'].shift(lag)
+    
+    lagged_econ_cols = [f'{col}_lag_12' for col in ECONOMIC_FEATURES]
+    df.dropna(subset=['lag_12'] + lagged_econ_cols, inplace=True)
 
-    # Sort and add calendar
-    df = df.sort_values(['client_id','date'])
-    df['month'] = df['date'].dt.month.astype(int)
+    forecasts, audit_rows, all_modeling_data, stat_test_results, xgb_imp_rows = [], [], [], [], []
 
-    # Forward-fill ONLY market vars by client (avoid leaking the target)
-    for c in MARKET_VARS:
-        if c in df.columns:
-            df[c] = df.groupby('client_id')[c].ffill()
+    # 4. Main loop for per-BU bake-off
+    for bu_name in df['bu'].unique():
+        logger.info(f"\n{'='*40}\nProcessing BU: {bu_name}\n{'='*40}")
+        bu_df = df[df['bu'] == bu_name].set_index('date')
+        bu_ts = bu_df['TotalCallsOffered'].asfreq('MS')
+        all_modeling_data.append(bu_df.copy())
 
-    # Build lags (target + drivers)
-    for lag in range(1, MAX_LAGS + 1):
-        df[f'lag_{lag}']     = df.groupby('client_id')['total_cases_opened'].shift(lag)
-        if 'TotalOrders' in df.columns:
-            df[f'drv_lag_{lag}'] = df.groupby('client_id')['TotalOrders'].shift(lag)
+        xgb_features = (['trend', 'sin_month', 'cos_month', 'lag_3', 'lag_6', 'lag_12'] + 
+                        [f'{c}_lag_{l}' for c in ECONOMIC_FEATURES for l in [3, 6, 12]])
+        
+        stat_test_results.append(perform_statistical_tests(bu_df, bu_name, xgb_features))
+        
+        train_df, valid_df = bu_df.iloc[:-VAL_LEN_6M], bu_df.iloc[-VAL_LEN_6M:]
+        y_val = valid_df['TotalCallsOffered']
+        
+        cwlb_weights, cwlb_smape, _ = find_best_weights(bu_ts, [1, 3, 6, 12], {1:{'max':0.5}, 3:{'min':0.2}, 'combined':[{'lags':[3,6,12], 'min':0.5}]}, VAL_LEN_6M, GRID_STEP)
+        logger.info(f"  -> CWLB evaluated: SMAPE={cwlb_smape:.2f if cwlb_smape != np.inf else 'N/A'}")
 
-    forecasts, audit_rows, modeling_data, stat_test_results, all_model_summaries, xgb_imp_rows = [], [], [], [], [], []
+        X_train, y_train = train_df[xgb_features], train_df['TotalCallsOffered']
+        X_val = valid_df[xgb_features]
+        xgb = XGBRegressor(objective="reg:squarederror", n_estimators=100, learning_rate=0.05, max_depth=3, random_state=42)
+        xgb.fit(X_train, np.log1p(y_train))
+        xgb_preds = safe_expm1(xgb.predict(X_val))
+        xgb_smape = smape(y_val, xgb_preds)
+        logger.info(f"  -> XGBoost evaluated: SMAPE={xgb_smape:.2f}")
 
-    # ----------------- per client loop -----------------
-    for cid, client_df_orig in df.groupby('client_id'):
-        logger.info(f"\n{'='*36}\nProcessing Client: {cid}\n{'='*36}")
+        imp = {feat: score for feat, score in zip(xgb.feature_names_in_, xgb.feature_importances_)}
+        xgb_imp_rows.append({'bu': bu_name, 'feature_importance': json.dumps(imp)})
 
-        # Stats snapshot (ADF)
-        stat_test_results.append(perform_statistical_tests(client_df_orig, cid))
-
-        client_df = client_df_orig.copy()
-        client_df['trend'] = np.arange(len(client_df), dtype=float)
-
-        ts = client_df.set_index('date')['total_cases_opened'].asfreq('MS')
-
-        # Build modeling table (exclude target from features to avoid leakage)
-        feat_all = pd.DataFrame({'y': ts}).join(
-            client_df.set_index('date').drop(columns=['total_cases_opened'], errors='ignore')
-        )
-
-        # Clean to numeric + drop any NA rows (forces all 12 lags available)
-        cols_to_clean = [c for c in feat_all.columns if c not in ['client_id', 'vol_type', 'date']]
-        for col in cols_to_clean:
-            feat_all[col] = pd.to_numeric(feat_all[col], errors='coerce')
-        feat_all.dropna(inplace=True)
-
-        if len(feat_all) < VAL_LEN_6M + 2:
-            logger.warning(f"Skipping {cid} - insufficient data for validation.")
-            continue
-
-        modeling_data.append(feat_all.assign(client_id=cid))
-
-        # Split train/validation (last 6 months)
-        train_df, val_df = feat_all.iloc[:-VAL_LEN_6M], feat_all.iloc[-VAL_LEN_6M:]
-        y_tr_log = np.log1p(np.asarray(train_df['y'].values, dtype=float))
-
-        # Candidate features (target removed)
-        candidate_cols = [c for c in feat_all.columns if c not in ['y', 'client_id', 'vol_type', 'date']]
-
-        X_tr = train_df[candidate_cols].astype(float)
-        X_val = val_df[candidate_cols].astype(float)
-
-        model_preds_val, model_meta = {}, {}
-
-        # ---------------- 1) XGBoost (log target) ----------------
-        try:
-            xgb = XGBRegressor(
-                objective="reg:squarederror",
-                n_estimators=100, learning_rate=0.05, max_depth=3, random_state=42
-            ).fit(X_tr.values, y_tr_log)
-            model_preds_val['XGBoost'] = safe_expm1(xgb.predict(X_val.values))
-            model_meta['XGBoost'] = {'model': xgb, 'columns': candidate_cols}
-            gain = xgb.get_booster().get_score(importance_type='gain')
-            xgb_imp_rows.append({
-                'client_id': cid,
-                'feature_importance': json.dumps(sorted(gain.items(), key=lambda i: i[1], reverse=True))
-            })
-        except Exception as e:
-            logger.warning(f"{cid}: XGBoost failed: {e}")
-
-        # ---------------- 2) OLS_Auto_Market (Lasso → prune → cap → OLS) ----------------
-        try:
-            scaler = StandardScaler(with_mean=True, with_std=True).fit(X_tr.values)
-            X_tr_scaled = scaler.transform(X_tr.values)
-
-            lasso = LassoCV(cv=min(3, max(2, len(train_df)//4)),
-                            random_state=42, n_alphas=100).fit(X_tr_scaled, y_tr_log)
-            sel_idx = np.where(np.abs(lasso.coef_) > 1e-8)[0].tolist()
-            selected_feats = [candidate_cols[i] for i in sel_idx]
-
-            only_market = (len(selected_feats) > 0) and all(f in MARKET_VARS for f in selected_feats)
-            if only_market and 'trend' in candidate_cols and 'trend' not in selected_feats:
-                logger.info(f"{cid}: Only market vars selected — forcing 'trend' into OLS.")
-                selected_feats.append('trend')
-
-            if not selected_feats:
-                fallback = [c for c in ['lag_12','lag_1','lag_2','lag_3','TotalOrders','drv_lag_1','trend','month'] if c in candidate_cols]
-                selected_feats = fallback[:4] if fallback else candidate_cols[:3]
-
-            keep_priority = [c for c in ['lag_12','lag_1','lag_2','lag_3','TotalOrders','drv_lag_1','trend','month'] if c in candidate_cols]
-            pruned = prune_collinearity(train_df[selected_feats].astype(float), keep_priority, thr=0.95)
-
-            n_obs = len(train_df)
-            max_feats = max(1, min(6, n_obs - 6))
-            if len(pruned) > max_feats:
-                ytmp = y_tr_log
-                feat_scores = []
-                for c in pruned:
-                    xv = train_df[c].values
-                    cor = np.corrcoef(ytmp, xv)[0,1] if np.isfinite(xv).sum() >= 3 else 0.0
-                    feat_scores.append((c, abs(float(cor)) if np.isfinite(cor) else 0.0))
-                pruned = [c for c, _ in sorted(feat_scores, key=lambda t: t[1], reverse=True)[:max_feats]]
-
-            if 'lag_12' in candidate_cols and 'lag_12' not in pruned:
-                if len(pruned) >= max_feats:
-                    ytmp = y_tr_log
-                    corrs = [(c, abs(np.corrcoef(ytmp, train_df[c].values)[0,1]) if np.isfinite(train_df[c].values).sum()>=3 else 0.0) for c in pruned]
-                    weakest = sorted(corrs, key=lambda t: t[1])[0][0] if corrs else pruned[-1]
-                    pruned = [c for c in pruned if c != weakest]
-                pruned.append('lag_12')
-
-            selected_feats = pruned
-
-            Xtr_sel_df = train_df[selected_feats].astype(float)
-            Xval_sel_df = val_df[selected_feats].astype(float)
-
-            Xtr_mat = sm.add_constant(Xtr_sel_df, has_constant='add').to_numpy(dtype=float)
-            Xval_mat = sm.add_constant(Xval_sel_df, has_constant='add').to_numpy(dtype=float)
-
-            ols_auto = sm.OLS(y_tr_log, Xtr_mat).fit()
-            raw_val = ols_auto.predict(Xval_mat)
-            model_preds_val['OLS_Auto_Market'] = safe_expm1(raw_val)
-            model_meta['OLS_Auto_Market'] = {'model': ols_auto, 'features': selected_feats}
-
-            try:
-                all_model_summaries.append(
-                    f"--- Client:{cid}, Model:OLS_Auto_Market ---\n{str(ols_auto.summary())}\n"
-                )
-            except Exception:
-                pass
-        except Exception as e:
-            logger.warning(f"{cid}: OLS_Auto_Market failed: {e}")
-
-        # ---------------- 3) WeightedLagBlend (target lags 3,6,12) ----------------
-        try:
-            lags = {l: feat_all[f'lag_{l}'].reindex(val_df.index) for l in [3,6,12] if f'lag_{l}' in feat_all.columns}
-            if set([3,6,12]).issubset(lags.keys()):
-                mask = pd.concat(lags.values(), axis=1).notna().all(axis=1)
-                best_w, best_s = (1.0,0.0,0.0), np.inf
-                if mask.any():
-                    yv = val_df['y'][mask].values
-                    l3, l6, l12 = lags[3][mask].values, lags[6][mask].values, lags[12][mask].values
-                    for w1 in np.arange(0, 1.05, 0.05):
-                        for w2 in np.arange(0, 1.05-w1, 0.05):
-                            w3 = 1 - w1 - w2
-                            pred = w1*l3 + w2*l6 + w3*l12
-                            s = smape(yv, pred)
-                            if s < best_s:
-                                best_s, best_w = s, (w1,w2,w3)
-                wl_pred = best_w[0]*lags[3].fillna(0) + best_w[1]*lags[6].fillna(0) + best_w[2]*lags[12].fillna(0)
-                model_preds_val['WeightedLagBlend'] = wl_pred.values
-                model_meta['WeightedLagBlend'] = {'weights': {'w_lag3':best_w[0],'w_lag6':best_w[1],'w_lag12':best_w[2]}}
-        except Exception as e:
-            logger.warning(f"{cid}: WeightedLagBlend failed: {e}")
-
-        # ---------------- 4) WeightedLagBlendDrv (blend WLB with driver seasonal) ----------------
-        try:
-            # Compute driver YoY-weighted growth at anchor (last available date in train)
-            drv_series = client_df.set_index('date')['TotalOrders'].asfreq('MS')
-            anchor = ts.index[-1]  # end of history
-            r_drv = compute_driver_r_yoy_weighted(drv_series, pd.DatetimeIndex([anchor]))
-            if 'WeightedLagBlend' in model_preds_val and np.isfinite(r_drv):
-                # seasonal driver naive for val months: y(t-12) * (1 + r_drv)
-                sdrv = [ts.get(d - pd.DateOffset(months=12), np.nan) * (1.0 + r_drv) for d in val_df.index]
-                sdrv = pd.Series(sdrv, index=val_df.index).fillna(0.0)
-                wlb = pd.Series(model_preds_val['WeightedLagBlend'], index=val_df.index).fillna(0.0)
-
-                best_lam, best_s = 0.5, np.inf
-                for lam in np.arange(0.5, 0.96, 0.05):
-                    p_try = lam*wlb + (1.0-lam)*sdrv
-                    s = smape(val_df['y'].values, p_try.values)
-                    if s < best_s:
-                        best_s, best_lam = s, lam
-                model_preds_val['WeightedLagBlendDrv'] = (best_lam*wlb + (1.0-best_lam)*sdrv).values
-                model_meta['WeightedLagBlendDrv'] = {'lambda': float(best_lam), 'r_drv': float(r_drv)}
-        except Exception as e:
-            logger.warning(f"{cid}: WeightedLagBlendDrv failed: {e}")
-
-        # ---------------- 5) Ridge_DriverLags (log-target) ----------------
-        try:
-            drv_feats = [f'drv_lag_{k}' for k in range(1, MAX_LAGS+1) if f'drv_lag_{k}' in candidate_cols]
-            add_feats = [c for c in ['TotalOrders','trend','month'] if c in candidate_cols]
-            ridge_feats = drv_feats + add_feats
-            if ridge_feats:
-                Xtr_r = train_df[ridge_feats].astype(float).values
-                Xval_r = val_df[ridge_feats].astype(float).values
-                scaler_r = StandardScaler(with_mean=True, with_std=True).fit(Xtr_r)
-                Xtr_rs, Xval_rs = scaler_r.transform(Xtr_r), scaler_r.transform(Xval_r)
-
-                ridge = RidgeCV(alphas=np.logspace(-3, 3, 25), cv=min(3, max(2, len(train_df)//4))).fit(Xtr_rs, y_tr_log)
-                pred_val = safe_expm1(ridge.predict(Xval_rs))
-                model_preds_val['Ridge_DriverLags'] = pred_val
-                model_meta['Ridge_DriverLags'] = {'model': ridge, 'scaler': scaler_r, 'features': ridge_feats}
-        except Exception as e:
-            logger.warning(f"{cid}: Ridge_DriverLags failed: {e}")
-
-        # ---------------- 6) OLS_DriverLags (log-target, prune+cap) ----------------
-        try:
-            drv_feats = [f'drv_lag_{k}' for k in range(1, MAX_LAGS+1) if f'drv_lag_{k}' in candidate_cols]
-            add_feats = [c for c in ['TotalOrders','trend','month'] if c in candidate_cols]
-            ols_drv_feats = drv_feats + add_feats
-            if ols_drv_feats:
-                # prune and cap
-                keep_priority = [c for c in ['drv_lag_12','drv_lag_6','drv_lag_3','drv_lag_1','TotalOrders','trend','month'] if c in ols_drv_feats]
-                pruned = prune_collinearity(train_df[ols_drv_feats].astype(float), keep_priority, thr=0.95)
-                n_obs = len(train_df)
-                max_feats = max(1, min(6, n_obs - 6))
-                if len(pruned) > max_feats:
-                    ytmp = y_tr_log
-                    feat_scores = []
-                    for c in pruned:
-                        xv = train_df[c].values
-                        cor = np.corrcoef(ytmp, xv)[0,1] if np.isfinite(xv).sum() >= 3 else 0.0
-                        feat_scores.append((c, abs(float(cor)) if np.isfinite(cor) else 0.0))
-                    pruned = [c for c, _ in sorted(feat_scores, key=lambda t: t[1], reverse=True)[:max_feats]]
-                if 'drv_lag_12' in ols_drv_feats and 'drv_lag_12' not in pruned:
-                    if len(pruned) >= max_feats:
-                        ytmp = y_tr_log
-                        corrs = [(c, abs(np.corrcoef(ytmp, train_df[c].values)[0,1]) if np.isfinite(train_df[c].values).sum()>=3 else 0.0) for c in pruned]
-                        weakest = sorted(corrs, key=lambda t: t[1])[0][0] if corrs else pruned[-1]
-                        pruned = [c for c in pruned if c != weakest]
-                    pruned.append('drv_lag_12')
-
-                Xtr_sel_df = train_df[pruned].astype(float)
-                Xval_sel_df = val_df[pruned].astype(float)
-                Xtr_mat = sm.add_constant(Xtr_sel_df, has_constant='add').to_numpy(dtype=float)
-                Xval_mat = sm.add_constant(Xval_sel_df, has_constant='add').to_numpy(dtype=float)
-                ols_drv = sm.OLS(y_tr_log, Xtr_mat).fit()
-                raw_val = ols_drv.predict(Xval_mat)
-                model_preds_val['OLS_DriverLags'] = safe_expm1(raw_val)
-                model_meta['OLS_DriverLags'] = {'model': ols_drv, 'features': pruned}
-
-                try:
-                    all_model_summaries.append(
-                        f"--- Client:{cid}, Model:OLS_DriverLags ---\n{str(ols_drv.summary())}\n"
-                    )
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning(f"{cid}: OLS_DriverLags failed: {e}")
-
-        # ---------------- 7) SeasonalNaive models ----------------
-        try:
-            snaive_gr, snaive_diff = [], []
-            full_ts_for_pos = df[df['client_id'] == cid].set_index('date')['total_cases_opened'].asfreq('MS')
-            for d in val_df.index:
-                base = ts.get(d - pd.DateOffset(months=12), np.nan)
-                pos = full_ts_for_pos.index.get_loc(d)
-                r  = recent_3m_growth(full_ts_for_pos, pos)
-                rp = prior_year_3m_growth(full_ts_for_pos, pos)
-                snaive_gr.append(base * (1 + r) if pd.notna(base) else np.nan)
-                snaive_diff.append(base * (1 + (r - rp)) if pd.notna(base) else np.nan)
-            model_preds_val['SeasonalNaive3mGR'] = np.asarray(snaive_gr, dtype=float)
-            model_preds_val['SeasonalNaive3mDiffGR'] = np.asarray(snaive_diff, dtype=float)
-        except Exception as e:
-            logger.warning(f"{cid}: SeasonalNaive models failed: {e}")
-
-        # -------- Winner by 6m SMAPE --------
-        if not model_preds_val:
-            logger.warning(f"{cid}: No models produced validation predictions; skipping.")
-            continue
-        scores = {name: safe_reg_metrics(val_df['y'].values, pred)['smape'] for name, pred in model_preds_val.items()}
-        winner = min(scores, key=scores.get)
-        logger.info(f"✓ WINNER for {cid}: {winner} (SMAPE: {scores[winner]:.2f})")
-        for name, pred in model_preds_val.items():
-            row = {'client_id': cid, 'model': name, 'winner_model': winner, 'val_smape_6m': float(scores.get(name, np.nan))}
-            # add hyperparams if present
-            if name == 'WeightedLagBlend':
-                row.update(model_meta['WeightedLagBlend']['weights'])
-            if name == 'WeightedLagBlendDrv':
-                row['lambda'] = model_meta['WeightedLagBlendDrv']['lambda']
-                row['r_drv']  = model_meta['WeightedLagBlendDrv']['r_drv']
-            audit_rows.append(row)
-
-        # ------------- Recursive Forecast (15 months) -------------
-        hist = deque(ts.tolist(), maxlen=60)
-        drv_hist = deque(client_df['TotalOrders'].dropna().tolist(), maxlen=60)
-
-        mk_df = client_df[MARKET_VARS].copy()
-        if not mk_df.empty:
-            last_known_market = {mv: float(mk_df[mv].dropna().iloc[-1]) for mv in MARKET_VARS if mv in mk_df.columns and mk_df[mv].notna().any()}
+        if cwlb_smape <= xgb_smape:
+            winner, winner_smape, winner_details = 'CWLB', cwlb_smape, cwlb_weights
+            long_weights, _, _ = find_best_weights(bu_ts, [3, 6, 12], {3:{'min':0.4}, 6:{'min':0.2}, 12:{'min':0.1}}, 12, GRID_STEP)
         else:
-            last_known_market = {}
-        last_trend = float(client_df['trend'].iloc[-1]) if 'trend' in client_df.columns else float(len(client_df)-1)
+            winner, winner_smape, winner_details = 'XGBoost', xgb_smape, {'n_estimators': 100, 'lr': 0.05, 'max_depth': 3}
+            long_weights = None
+        
+        logger.info(f"✓ WINNER for {bu_name}: {winner} (SMAPE: {winner_smape:.2f})")
+        audit_rows.append({'bu': bu_name, 'winner': winner, 'winner_smape': winner_smape, 'cwlb_smape': cwlb_smape, 'xgb_smape': xgb_smape, 'details': json.dumps(winner_details)})
 
-        driver_fx_lookup = ({pd.Timestamp(d): float(v) for d, v in drv_fx_df[['date','TotalOrders_fx']].values}
-                            if not drv_fx_df.empty else {})
+        if winner_smape != np.inf:
+            logger.info(f"Generating {FORECAST_HORIZON}-month forecast with {winner}...")
+            hist = deque(bu_ts.tolist(), maxlen=24)
+            fred_hist_df = bu_df[ECONOMIC_FEATURES].copy()
+            future_idx = pd.date_range(bu_ts.index[-1], periods=FORECAST_HORIZON + 1, freq='MS')[1:]
+            
+            for i, d in enumerate(future_idx, 1):
+                pred = np.nan
+                if winner == 'CWLB' and cwlb_weights and long_weights:
+                    if i == 1: w, lags_to_use = cwlb_weights, {1: hist[-1], 3: hist[-3], 6: hist[-6], 12: hist[-12]}
+                    elif i in [2, 3]: w, lags_to_use = cwlb_weights, {2: hist[-2], 3: hist[-3], 6: hist[-6], 12: hist[-12]}
+                    else: w, lags_to_use = long_weights, {3: hist[-3], 6: hist[-6], 12: hist[-12]}
+                    pred = sum(w.get(lag, 0) * value for lag, value in lags_to_use.items())
+                elif winner == 'XGBoost':
+                    row = {'trend': (train_df['trend'].max() or 0) + len(valid_df) + i,
+                           'sin_month': np.sin(2*np.pi*d.month/12), 'cos_month': np.cos(2*np.pi*d.month/12),
+                           'lag_3': hist[-3], 'lag_6': hist[-6], 'lag_12': hist[-12]}
+                    for col in ECONOMIC_FEATURES:
+                        for lag in [3, 6, 12]:
+                            row[f'{col}_lag_{lag}'] = fred_hist_df[col].iloc[-lag]
+                    x_row_df = pd.DataFrame([row])[xgb_features]
+                    pred = safe_expm1(xgb.predict(x_row_df)[0])
+                else: pred = hist[-1]
+                hist.append(pred)
+                forecasts.append({'fx_date':d, 'client_id':bu_name, 'vol_type':f'phone_{winner.lower()}', 'fx_vol':safe_round(pred), 'fx_id':f"{winner.lower()}_phone_{STAMP:%Y%m%d}", 'fx_status':"A", 'load_ts':STAMP})
 
-        future_idx = pd.date_range(ts.index[-1], periods=FORECAST_HORIZON+1, freq='MS')[1:]
+    # 5. Save All Local Deliverables and Conditionally Push to GBQ
+    pd.DataFrame(audit_rows).to_csv(MODEL_EVAL_CSV, index=False)
+    logger.info(f"✓ Model evaluation results saved to {MODEL_EVAL_CSV}")
 
-        xgb_model   = model_meta.get('XGBoost', {}).get('model')
-        xgb_columns = model_meta.get('XGBoost', {}).get('columns')
-        ols_auto    = model_meta.get('OLS_Auto_Market', {}).get('model')
-        ols_auto_feats = model_meta.get('OLS_Auto_Market', {}).get('features', [])
-        ridge_meta  = model_meta.get('Ridge_DriverLags', {})
-        ols_drv_meta= model_meta.get('OLS_DriverLags', {})
-        wlb_meta    = model_meta.get('WeightedLagBlend', {})
-        wlbdrv_meta = model_meta.get('WeightedLagBlendDrv', {})
+    if stat_test_results:
+        pd.DataFrame(stat_test_results).to_csv(STATS_CSV, index=False)
+        logger.info(f"✓ Statistical tests saved to {STATS_CSV}")
+    
+    if xgb_imp_rows:
+        pd.DataFrame(xgb_imp_rows).to_csv(XGB_VIZ_CSV, index=False)
+        logger.info(f"✓ XGBoost feature importances saved to {XGB_VIZ_CSV}")
 
-        # Precompute driver growth for recursion if needed
-        drv_series = client_df.set_index('date')['TotalOrders'].asfreq('MS')
-        r_drv_anchor = compute_driver_r_yoy_weighted(drv_series, pd.DatetimeIndex([ts.index[-1]]))
+    if all_modeling_data:
+        pd.concat(all_modeling_data).to_csv(MODELING_DATA_CSV, index=True)
+        logger.info(f"✓ Combined modeling data saved to {MODELING_DATA_CSV}")
 
-        for i, d in enumerate(future_idx, 1):
-            # Driver for this month
-            last_driver = (drv_hist[-1] if len(drv_hist) else 0.0)
-            current_total_orders = driver_fx_lookup.get(d, last_driver)
+    with open(MODEL_SUMMARIES_FILE, 'w') as f:
+        f.write("No statsmodels summaries generated in this script version.\n")
 
-            pred = np.nan
-
-            if winner in ['XGBoost', 'OLS_Auto_Market', 'Ridge_DriverLags', 'OLS_DriverLags']:
-                # Build feature row with BOTH target lags and driver lags
-                row = {}
-                for k in range(1, MAX_LAGS + 1):
-                    row[f'lag_{k}']     = (hist[-k] if len(hist) >= k else (hist[-1] if len(hist) else 0.0))
-                    row[f'drv_lag_{k}'] = (drv_hist[-k] if len(drv_hist) >= k else current_total_orders)
-
-                row['month']       = int(d.month)
-                row['TotalOrders'] = float(current_total_orders)
-                row['trend']       = float(last_trend + i)
-                for mv in MARKET_VARS:
-                    if mv in df.columns:
-                        row[mv] = float(last_known_market.get(mv, 0.0))
-
-                if winner == 'XGBoost' and xgb_model is not None and xgb_columns is not None:
-                    x_row_full = pd.DataFrame([{c: row.get(c, 0.0) for c in xgb_columns}])
-                    raw = xgb_model.predict(x_row_full.values)[0]
-                    pred = float(safe_expm1(raw))
-
-                elif winner == 'OLS_Auto_Market' and ols_auto is not None:
-                    x_df = pd.DataFrame([{c: row.get(c, 0.0) for c in ols_auto_feats}]).astype(float)
-                    X_row = sm.add_constant(x_df, has_constant='add').to_numpy(dtype=float)
-                    raw = float(ols_auto.predict(X_row)[0])
-                    pred = float(safe_expm1(raw))
-
-                elif winner == 'Ridge_DriverLags' and ridge_meta:
-                    feats = ridge_meta['features']
-                    scaler_r = ridge_meta['scaler']
-                    ridge = ridge_meta['model']
-                    x_r = pd.DataFrame([{c: row.get(c, 0.0) for c in feats}]).astype(float).values
-                    x_r_s = scaler_r.transform(x_r)
-                    raw = float(ridge.predict(x_r_s)[0])
-                    pred = float(safe_expm1(raw))
-
-                elif winner == 'OLS_DriverLags' and ols_drv_meta:
-                    feats = ols_drv_meta['features']
-                    x_df = pd.DataFrame([{c: row.get(c, 0.0) for c in feats}]).astype(float)
-                    X_row = sm.add_constant(x_df, has_constant='add').to_numpy(dtype=float)
-                    raw = float(ols_drv_meta['model'].predict(X_row)[0])
-                    pred = float(safe_expm1(raw))
-
-            elif winner == 'WeightedLagBlend' and wlb_meta:
-                w = wlb_meta['weights']
-                y3  = hist[-3]  if len(hist)>=3  else (hist[-1] if len(hist) else 0.0)
-                y6  = hist[-6]  if len(hist)>=6  else (hist[-1] if len(hist) else 0.0)
-                y12 = hist[-12] if len(hist)>=12 else (hist[-1] if len(hist) else 0.0)
-                pred = float(w['w_lag3']*y3 + w['w_lag6']*y6 + w['w_lag12']*y12)
-
-            elif winner == 'WeightedLagBlendDrv' and wlbdrv_meta and wlb_meta:
-                w = wlb_meta['weights']
-                y3  = hist[-3]  if len(hist)>=3  else (hist[-1] if len(hist) else 0.0)
-                y6  = hist[-6]  if len(hist)>=6  else (hist[-1] if len(hist) else 0.0)
-                y12 = hist[-12] if len(hist)>=12 else (hist[-1] if len(hist) else 0.0)
-                wlb = w['w_lag3']*y3 + w['w_lag6']*y6 + w['w_lag12']*y12
-
-                base = hist[-12] if len(hist) >= 12 else (hist[-1] if len(hist) else 0.0)
-                rdrv = r_drv_anchor if np.isfinite(r_drv_anchor) else 0.0
-                sdrv = base * (1.0 + rdrv)
-
-                lam = float(wlbdrv_meta.get('lambda', 0.8))
-                pred = float(lam*wlb + (1.0 - lam)*sdrv)
-
-            else:  # SeasonalNaive* winners
-                base = hist[-12] if len(hist) >= 12 else (hist[-1] if len(hist) else 0.0)
-                temp_series = pd.Series(list(hist))
-                pos = len(temp_series)
-                r = recent_3m_growth(temp_series, pos)
-                if winner == 'SeasonalNaive3mGR':
-                    pred = float(base * (1.0 + r))
-                else:  # SeasonalNaive3mDiffGR
-                    rp = prior_year_3m_growth(temp_series, pos)
-                    pred = float(base * (1.0 + (r - rp)))
-
-            # update histories for next step
-            hist.append(pred)
-            drv_hist.append(current_total_orders)  # ALWAYS push the driver
-
-            forecasts.append({
-                'fx_date': d,
-                'client_id': cid,
-                'vol_type': 'tickets',
-                'fx_vol': safe_round(pred),
-                'fx_id': f"{FX_ID_PREFIX[winner]}_{STAMP:%Y%m%d}",
-                'fx_status': "A",
-                'load_ts': STAMP
-            })
-
-    # --- Output (local only) ---
     if forecasts:
-        fx_df = pd.DataFrame(forecasts).sort_values(['client_id','fx_date'])
-        fx_df.to_csv(LOCAL_CSV, index=False)
-        pd.DataFrame(audit_rows).sort_values(['client_id']).to_csv(AUDIT_CSV, index=False)
-        if modeling_data:
-            pd.concat(modeling_data).to_csv(MODELING_DATA_CSV, index=False)
-        if stat_test_results:
-            pd.DataFrame(stat_test_results).to_csv(STATS_CSV, index=False)
-        if all_model_summaries:
-            with open(SUMMARIES_FILE, 'w') as f:
-                f.write("\n\n".join(all_model_summaries))
-        if xgb_imp_rows:
-            pd.DataFrame(xgb_imp_rows).to_csv(XGB_VIZ_CSV, index=False)
+        fx_df = pd.DataFrame(forecasts).sort_values(['client_id', 'fx_date'])
+        fx_df.to_csv(FORECAST_RESULTS_CSV, index=False)
+        logger.info(f"✓ Forecast data saved locally to {FORECAST_RESULTS_CSV}")
+        
+        logger.warning("GBQ PUSH IS DISABLED FOR TESTING. No data was written to the database.")
+        # -------------------------------------------------------------------------
+        # --- GBQ PUSH BLOCK ---
+        # --- THIS SECTION IS DISABLED FOR TESTING. UNCOMMENT TO ENABLE MONTHLY PUSH.
+        # -------------------------------------------------------------------------
+        # logger.info(f"Pushing {len(fx_df):,} forecast rows to {DEST_TABLE}...")
+        # bigquery_manager.import_data_to_bigquery(fx_df, DEST_TABLE, gbq_insert_action="append", auto_convert_df=True)
+        # 
+        # client_list_str = str(list(fx_df['client_id'].unique()))[1:-1]
+        # dedup_sql = f\"\"\"
+        # UPDATE `{DEST_TABLE}` t
+        # SET t.fx_status = 'I'
+        # WHERE t.fx_status = 'A' AND t.vol_type LIKE 'phone_%'
+        #   AND t.client_id IN ({client_list_str})
+        #   AND EXISTS (
+        #     SELECT 1 FROM `{DEST_TABLE}` s
+        #     WHERE s.client_id = t.client_id
+        #       AND s.vol_type = t.vol_type
+        #       AND s.fx_date = t.fx_date
+        #       AND s.load_ts > t.load_ts
+        #   )
+        # \"\"\"
+        # bigquery_manager.run_gbq_sql(dedup_sql, return_dataframe=False)
+        # logger.info("✓ Older phone forecasts deactivated in GBQ.")
+        # 
+        # bigquery_manager.update_log_in_bigquery()
+        # logger.info("✓ Forecasting complete and results pushed to BigQuery.")
+        # -------------------------------------------------------------------------
 
-        logger.info("✓ All local audit files saved.")
-        logger.info("✓ Credit ticket forecasting completed successfully (local only).")
     else:
         logger.warning("No forecasts were generated.")
 
 except Exception as exc:
-    email_manager.handle_error("Credit Ticket Forecasting Script Failure", exc, is_test=True)
+    email_manager.handle_error("Credit Phone Production Script Failure", exc, is_test=True)
+
+
+(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_299_File.py
+Traceback (most recent call last):
+  File "c:\WFM_Scripting\Forecasting\Rpt_299_File.py", line 307, in <module>
+    email_manager.handle_error("Credit Phone Production Script Failure", exc, is_test=True)
+  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1319, in handle_error
+    raise exception
+  File "c:\WFM_Scripting\Forecasting\Rpt_299_File.py", line 195, in <module>
+    stat_test_results.append(perform_statistical_tests(bu_df, bu_name, xgb_features))
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "c:\WFM_Scripting\Forecasting\Rpt_299_File.py", line 142, in perform_statistical_tests
+    corr, p_val = pearsonr(target[mask], predictor[mask])
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\scipy\stats\_stats_py.py", line 4839, in pearsonr
+    threshold = xp.finfo(dtype).eps ** 0.75
+                ^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\numpy\core\getlimits.py", line 516, in __new__
+    raise ValueError("data type %r not inexact" % (dtype))
+ValueError: data type <class 'numpy.object_'> not inexact
