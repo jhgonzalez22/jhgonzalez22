@@ -1,4 +1,4 @@
--- 1) One clean row per SkillTargetID → client mapping
+-- 1) One clean mapping row per SkillTargetID
 WITH SkillGroupAndClient AS (
   SELECT
     sgk.SkillGroupID,            -- equals SkillTargetID
@@ -13,23 +13,37 @@ WITH SkillGroupAndClient AS (
   WHERE
     ck.`Business Unit` = 'Answerlink'
     AND ck.Client = 'Matrix 1'
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY sgk.SkillGroupID ORDER BY sgk.SkillGroupID) = 1
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY sgk.SkillGroupID) = 1
 ),
 
--- 2) Pre-aggregate intervals WITHOUT any dimensional joins
-AggregatedMetrics AS (
+-- 2) De-duplicate intervals at the intended grain BEFORE any sums
+--    If the table has multiple rows per (SkillTargetID, DateTime), keep one.
+IntervalsDedup AS (
   SELECT
     asgi.SkillTargetID,
-    DATE_TRUNC(DATE(DATETIME(asgi.DateTime, 'America/Chicago')), MONTH) AS Month,
-    SUM(COALESCE(asgi.CallsHandled,        0)) AS CallsHandled,
-    SUM(COALESCE(asgi.RouterCallsAbandQ,   0)) AS RouterCallsAbandQ,
-    SUM(COALESCE(asgi.HandledCallsTime,    0)) AS HandledCallsTime
+    asgi.DateTime,
+    -- Use MAX() (or MIN()) across dup rows to collapse; values should be identical for true dupes
+    MAX(COALESCE(asgi.CallsHandled, 0))        AS CallsHandled,
+    MAX(COALESCE(asgi.RouterCallsAbandQ, 0))   AS RouterCallsAbandQ,
+    MAX(COALESCE(asgi.HandledCallsTime, 0))    AS HandledCallsTime
   FROM `clgx-taxbi-reg-bf03.tax_clnt_svcs.cc_cisco_skill_group_interval` AS asgi
   WHERE DATE(DATETIME(asgi.DateTime, 'America/Chicago')) BETWEEN '2025-09-01' AND '2025-09-30'
   GROUP BY 1,2
+),
+
+-- 3) Aggregate to Month AFTER dedup
+AggregatedMetrics AS (
+  SELECT
+    SkillTargetID,
+    DATE_TRUNC(DATE(DATETIME(DateTime, 'America/Chicago')), MONTH) AS Month,
+    SUM(CallsHandled)        AS CallsHandled,
+    SUM(RouterCallsAbandQ)   AS RouterCallsAbandQ,
+    SUM(HandledCallsTime)    AS HandledCallsTime
+  FROM IntervalsDedup
+  GROUP BY 1,2
 )
 
--- 3) Join once to the de-duped map
+-- 4) Join once to the clean map
 SELECT
   agg.Month,
   sgc.bu,
@@ -50,56 +64,3 @@ JOIN SkillGroupAndClient AS sgc
   ON agg.SkillTargetID = sgc.SkillGroupID
 WHERE (sgc.MRDomainID IN (1, 5000) OR sgc.MRDomainID IS NULL)
 ORDER BY agg.Month, sgc.client_id;
-
----------------------------
-
-WITH SkillGroupAndClient AS (
-  SELECT
-    sgk.SkillGroupID,
-    sgk.MRDomainID,
-    ck.Client,
-    ck.Id AS client_id,
-    ck.`Business Unit` AS bu
-  FROM `clgx-taxbi-reg-bf03.tax_clnt_svcs.cc_skillgroupkey` AS sgk
-  JOIN `clgx-taxbi-reg-bf03.tax_clnt_svcs.cc_client_key`   AS ck
-    ON sgk.ClientID = ck.Id
-  WHERE ck.`Business Unit` = 'Answerlink' AND ck.Client = 'Matrix 1'
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY sgk.SkillGroupID) = 1
-),
-
-Joined AS (
-  SELECT
-    DATE_TRUNC(DATE(DATETIME(asgi.DateTime, 'America/Chicago')), MONTH) AS Month,
-    sgc.client,
-    sgc.client_id,
-    sgc.bu,
-    sgc.MRDomainID,
-    COALESCE(asgi.CallsHandled, 0)      AS CallsHandled,
-    COALESCE(asgi.RouterCallsAbandQ, 0) AS RouterCallsAbandQ,
-    COALESCE(asgi.HandledCallsTime, 0)  AS HandledCallsTime
-  FROM `clgx-taxbi-reg-bf03.tax_clnt_svcs.cc_cisco_skill_group_interval` AS asgi
-  JOIN SkillGroupAndClient AS sgc
-    ON asgi.SkillTargetID = sgc.SkillGroupID
-  WHERE DATE(DATETIME(asgi.DateTime, 'America/Chicago')) BETWEEN '2025-09-01' AND '2025-09-30'
-)
-
-SELECT
-  Month,
-  bu,
-  client,
-  client_id,
-  CASE
-    WHEN MRDomainID = 5000 THEN 'Chat'
-    WHEN MRDomainID = 1 OR MRDomainID IS NULL THEN 'Phone'
-  END AS VolumeType,
-  SUM(CallsHandled)                         AS CallsHandled,
-  SUM(RouterCallsAbandQ)                    AS RouterCallsAbandQ,
-  SUM(CallsHandled + RouterCallsAbandQ)     AS CallsOffered,
-  SUM(HandledCallsTime)                     AS HandledCallsTime
-FROM Joined
-WHERE (MRDomainID IN (1, 5000) OR MRDomainID IS NULL)
-GROUP BY 1,2,3,4,5
-ORDER BY Month, client_id;
-
-
-
