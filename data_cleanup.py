@@ -18,6 +18,12 @@ FIX v12.4:
   process inside the main forecast generation loop. This is far less
   prone to error and ensures the model gets the exact features it expects.
 - This script also retains the WBL constraint logic from v12.3.
+
+ADDITIONAL FIX:
+- For XGBoost winner, we no longer force n_estimators = best_iteration
+  when refitting on full data (which could collapse the model to 0 trees
+  and give all-zero chat forecasts). Instead we reuse the same params
+  (minus early_stopping_rounds) and refit cleanly on full SMART data.
 """
 
 import os
@@ -114,40 +120,48 @@ def smape(actual, forecast):
     return np.mean(np.abs(actual - forecast) / denom) * 100
 
 def safe_round(x):
-    try: return int(max(0, round(float(x) if x is not None and np.isfinite(x) else 0.0)))
-    except: return 0
+    try:
+        return int(max(0, round(float(x) if x is not None and np.isfinite(x) else 0.0)))
+    except:
+        return 0
 
 def compute_3m_yoy_factor(series):
     s, ratios = series.dropna(), []
     for k in [1, 2, 3]:
         if len(s) > 12 + k:
             num, den = s.iloc[-k], s.iloc[-12 - k]
-            if den and den != 0: ratios.append(num / den)
+            if den and den != 0:
+                ratios.append(num / den)
     return float(np.mean(ratios)) if ratios else 1.0
 
 def find_best_weights(ts, lags, val_len, step, constraints=None):
-    if not lags or len(ts) < val_len + max(lags): return None, np.inf
+    if not lags or len(ts) < val_len + max(lags):
+        return None, np.inf
     validation_data, best_weights, best_smape = ts.iloc[-val_len:], None, np.inf
     weight_iters = [np.arange(0, 1.0 + step, step) for _ in range(len(lags) - 1)] if len(lags) > 1 else [[1.0]]
     for W in itertools.product(*weight_iters):
-        if sum(W) > 1.0 + 1e-9: continue
+        if sum(W) > 1.0 + 1e-9:
+            continue
         all_w = list(W) if len(lags) == 1 else list(W) + [1.0 - sum(W)]
         weights = {int(l): float(w) for l, w in zip(lags, all_w)}
         if constraints:
             valid = True
             for lag, limits in constraints.items():
                 if lag in weights:
-                    if 'min' in limits and weights[lag] < (limits['min'] - 1e-9): 
+                    if 'min' in limits and weights[lag] < (limits['min'] - 1e-9):
                         valid = False
-            if not valid: continue
+            if not valid:
+                continue
         
         forecast_vals = 0
         for lag, w in weights.items():
             forecast_vals += ts.shift(lag).reindex(validation_data.index) * w
         
-        if forecast_vals.isna().any(): continue
+        if forecast_vals.isna().any():
+            continue
         current_smape = smape(validation_data, forecast_vals)
-        if current_smape < best_smape: best_smape, best_weights = current_smape, weights
+        if current_smape < best_smape:
+            best_smape, best_weights = current_smape, weights
     return best_weights, best_smape
 
 def perform_correlation_analysis(full_data_long: pd.DataFrame, lag_list: list):
@@ -162,7 +176,8 @@ def perform_correlation_analysis(full_data_long: pd.DataFrame, lag_list: list):
             (full_data_long['VolumeType'] == series['type'])
         ].set_index('Month').sort_index().asfreq('MS')
         
-        if series_data_raw.empty: continue
+        if series_data_raw.empty:
+            continue
         
         analysis_df = series_data_raw.copy()
         for col in features_to_lag:
@@ -174,14 +189,17 @@ def perform_correlation_analysis(full_data_long: pd.DataFrame, lag_list: list):
         feature_cols = [col for col in all_cols if col not in ['Month', TARGET_COL, 'HandledCallsTime', 'Avg_Handle_Time']]
         
         analysis_df = analysis_df.dropna(subset=[TARGET_COL] + feature_cols)
-        if analysis_df.empty: continue
+        if analysis_df.empty:
+            continue
             
         target_series = analysis_df[TARGET_COL]
         
         for col in feature_cols:
             predictor_series = analysis_df[col]
-            if target_series.empty or predictor_series.empty: continue
-            if np.std(target_series) == 0 or np.std(predictor_series) == 0: continue
+            if target_series.empty or predictor_series.empty:
+                continue
+            if np.std(target_series) == 0 or np.std(predictor_series) == 0:
+                continue
             
             try:
                 corr, p_val = pearsonr(target_series, predictor_series)
@@ -212,7 +230,8 @@ def run_pipeline():
         # 1. LOAD MAIN DATA
         logger.info(f"Reading Main SQL: {MAIN_DATA_SQL_PATH}")
         df = bigquery_manager.run_gbq_sql(MAIN_DATA_SQL_PATH, return_dataframe=True)
-        if df is None or df.empty: raise ValueError("BigQuery returned no data.")
+        if df is None or df.empty:
+            raise ValueError("BigQuery returned no data.")
         df['Month'] = pd.to_datetime(df['Month'])
         df[TARGET_COL] = pd.to_numeric(df[TARGET_COL], errors='coerce').fillna(0).astype('float64')
         for col in ['UNRATE', 'HSN1F', 'FEDFUNDS', 'MORTGAGE30US']:
@@ -222,7 +241,8 @@ def run_pipeline():
         # 2. LOAD CALENDAR DATA
         logger.info(f"Reading Calendar SQL: {CALENDAR_SQL_PATH}")
         df_cal = bigquery_manager.run_gbq_sql(CALENDAR_SQL_PATH, return_dataframe=True)
-        if df_cal is None or df_cal.empty: raise ValueError("BigQuery returned no Calendar data.")
+        if df_cal is None or df_cal.empty:
+            raise ValueError("BigQuery returned no Calendar data.")
         cal_date_col = next((c for c in df_cal.columns if 'date' in c.lower() or 'month' in c.lower()), None)
         df_cal[cal_date_col] = pd.to_datetime(df_cal[cal_date_col])
         df_cal_monthly = df_cal.set_index(cal_date_col).resample('MS')[['business_day_count', 'holiday_count']].sum().reset_index()
@@ -240,7 +260,8 @@ def run_pipeline():
 
         # 4. MERGE CALENDAR INTO MAIN DF
         cols_to_drop = [c for c in ['business_day_count', 'holiday_count'] if c in df.columns]
-        if cols_to_drop: df.drop(columns=cols_to_drop, inplace=True)
+        if cols_to_drop:
+            df.drop(columns=cols_to_drop, inplace=True)
         df = pd.merge(df, df_cal_monthly, on='Month', how='left')
         df[['business_day_count', 'holiday_count']] = df[['business_day_count', 'holiday_count']].fillna(method='ffill').fillna(20)
 
@@ -257,7 +278,8 @@ def run_pipeline():
             feb_val = df.loc[feb_24_mask, TARGET_COL].values[0]
             if not df.loc[jan_24_mask, TARGET_COL].empty and df.loc[jan_24_mask, TARGET_COL].values[0] < 10:
                 df.loc[jan_24_mask, TARGET_COL] = feb_val
-        except IndexError: pass
+        except IndexError:
+            pass
 
         months_2023 = pd.date_range('2023-01-01', '2023-12-01', freq='MS')
         for m in months_2023:
@@ -266,7 +288,8 @@ def run_pipeline():
                 val = df.loc[chat_mask & (df['Month'] == m_future), TARGET_COL].values[0]
                 mask_23 = chat_mask & (df['Month'] == m)
                 df.loc[mask_23, TARGET_COL] = val
-            except IndexError: pass
+            except IndexError:
+                pass
         
         # --- Create SMART and DUMB dataframes (long-format) ---
         df_smart = df.copy()
@@ -333,7 +356,9 @@ def run_pipeline():
                 smapes['OLS'] = smape(y_valid, preds)
                 models['OLS'] = ols_model
                 logger.info(f"  OLS SMAPE: {smapes['OLS']:.2f}")
-            except Exception as e: smapes['OLS'] = np.inf; logger.warning(f"  OLS failed: {e}")
+            except Exception as e:
+                smapes['OLS'] = np.inf
+                logger.warning(f"  OLS failed: {e}")
 
             # --- Model 2: WBL (On DUMB Data) ---
             try:
@@ -341,7 +366,9 @@ def run_pipeline():
                 smapes['WBL'] = score
                 models['WBL'] = wts
                 logger.info(f"  WBL SMAPE: {smapes['WBL']:.2f} (Lags: {wbl_lags}, Constraints: {wbl_constraints})")
-            except Exception as e: smapes['WBL'] = np.inf; logger.warning(f"  WBL failed: {e}")
+            except Exception as e:
+                smapes['WBL'] = np.inf
+                logger.warning(f"  WBL failed: {e}")
 
             # --- Model 3: Native3mGR (On DUMB Data) ---
             try:
@@ -350,16 +377,24 @@ def run_pipeline():
                 smapes['Native3mGR'] = smape(y_true, preds)
                 models['Native3mGR'] = factor
                 logger.info(f"  Native3mGR SMAPE: {smapes['Native3mGR']:.2f}")
-            except Exception as e: smapes['Native3mGR'] = np.inf; logger.warning(f"  Native3mGR failed: {e}")
+            except Exception as e:
+                smapes['Native3mGR'] = np.inf
+                logger.warning(f"  Native3mGR failed: {e}")
 
             # --- Model 4: SARIMAX (On SMART Data) ---
             try:
                 X_train = train_smart[ser['features']].dropna()
                 y_train = train_smart.loc[X_train.index, TARGET_COL]
 
-                arima = pm.auto_arima(y_train, exogenous=X_train,
-                                      m=12, seasonal=True, suppress_warnings=True,
-                                      stepwise=True, error_action='ignore')
+                arima = pm.auto_arima(
+                    y_train,
+                    exogenous=X_train,
+                    m=12,
+                    seasonal=True,
+                    suppress_warnings=True,
+                    stepwise=True,
+                    error_action='ignore'
+                )
                 
                 X_valid = valid_smart[ser['features']].dropna()
                 y_valid = y_true.loc[X_valid.index] 
@@ -368,7 +403,9 @@ def run_pipeline():
                 smapes['SARIMAX'] = smape(y_valid, preds)
                 models['SARIMAX'] = arima
                 logger.info(f"  SARIMAX SMAPE: {smapes['SARIMAX']:.2f}")
-            except Exception as e: smapes['SARIMAX'] = np.inf; logger.warning(f"  SARIMAX failed: {e}")
+            except Exception as e:
+                smapes['SARIMAX'] = np.inf
+                logger.warning(f"  SARIMAX failed: {e}")
 
             # --- Model 5: XGBoost (On SMART Data) ---
             try:
@@ -378,7 +415,8 @@ def run_pipeline():
                 X_valid = valid_smart[ser['features']].dropna()
                 y_valid = y_true.loc[X_valid.index] 
 
-                if X_valid.empty: raise ValueError("XGB Validation set is empty after dropna")
+                if X_valid.empty:
+                    raise ValueError("XGB Validation set is empty after dropna")
 
                 reg = xgb.XGBRegressor(n_estimators=1000, early_stopping_rounds=20)
                 reg.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], verbose=False)
@@ -387,7 +425,9 @@ def run_pipeline():
                 smapes['XGBoost'] = smape(y_valid, preds)
                 models['XGBoost'] = reg
                 logger.info(f"  XGBoost SMAPE: {smapes['XGBoost']:.2f}")
-            except Exception as e: smapes['XGBoost'] = np.inf; logger.warning(f"  XGBoost failed: {e}")
+            except Exception as e:
+                smapes['XGBoost'] = np.inf
+                logger.warning(f"  XGBoost failed: {e}")
 
             # --- Winner ---
             valid_scores = {k: v for k, v in smapes.items() if v < np.inf}
@@ -454,13 +494,13 @@ def run_pipeline():
                     hist_deque.append(pred)
 
             elif best_model_name == 'Native3mGR':
-                 factor = models['Native3mGR']
-                 hist_data = ts_df_dumb_raw[TARGET_COL].copy()
-                 for d in df_future_exog.index:
-                     last_year_val = hist_data.get(d - pd.DateOffset(years=1), 0)
-                     pred = last_year_val * factor
-                     future_preds.append(pred)
-                     hist_data[d] = pred
+                factor = models['Native3mGR']
+                hist_data = ts_df_dumb_raw[TARGET_COL].copy()
+                for d in df_future_exog.index:
+                    last_year_val = hist_data.get(d - pd.DateOffset(years=1), 0)
+                    pred = last_year_val * factor
+                    future_preds.append(pred)
+                    hist_data[d] = pred
 
             elif best_model_name == 'SARIMAX':
                 model = models['SARIMAX']
@@ -473,18 +513,21 @@ def run_pipeline():
                 future_preds = model.predict(n_periods=FORECAST_HORIZON, exogenous=X_future[ser['features']])
 
             elif best_model_name == 'XGBoost':
+                # Reuse the same hyperparameters as the validation model,
+                # but DO NOT force n_estimators to best_iteration.
                 validation_model = models['XGBoost']
                 params = validation_model.get_params()
-                params['n_estimators'] = validation_model.best_iteration
+
+                # Remove early stopping from the final full-data refit
                 params.pop('early_stopping_rounds', None)
-                
+
                 final_model = xgb.XGBRegressor(**params)
-                
+
                 # Refit on full smart data
                 X_full = ts_df_smart[ser['features']].dropna()
                 y_full = ts_df_smart.loc[X_full.index, TARGET_COL]
                 final_model.fit(X_full, y_full)
-                
+
                 # Select the exact columns for prediction
                 future_preds = final_model.predict(X_future[ser['features']])
 
@@ -498,8 +541,10 @@ def run_pipeline():
                 })
 
         # 9. SAVE ALL RESULTS
-        if audit_rows: pd.DataFrame(audit_rows).to_csv(MODEL_EVAL_CSV, index=False)
-        if forecasts: pd.DataFrame(forecasts).to_csv(FORECAST_RESULTS_CSV, index=False)
+        if audit_rows:
+            pd.DataFrame(audit_rows).to_csv(MODEL_EVAL_CSV, index=False)
+        if forecasts:
+            pd.DataFrame(forecasts).to_csv(FORECAST_RESULTS_CSV, index=False)
         
         logger.info("\nScript finished successfully.")
         logger.info(f"Forecasts saved to: {FORECAST_RESULTS_CSV}")
