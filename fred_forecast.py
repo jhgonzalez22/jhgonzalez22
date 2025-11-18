@@ -348,4 +348,68 @@ if __name__ == "__main__":
             message=f"Script Failure: Report ID {REPORT_ID}",
             exception=e,
             is_test=True # As requested, send error emails to test recipients
+
+
+
+            ------------------2025-11-18 10:49:00,277 - INFO - Report ID: 666 - Connected to Google BigQuery.
+2025-11-18 10:49:02,351 - INFO - Report ID: 666 - --- Starting FRED Forecast Script (Report ID: 666) ---
+2025-11-18 10:49:04,257 - INFO - Report ID: 666 - Using target file directory: c:\Scripting
+2025-11-18 10:49:06,173 - INFO - Report ID: 666 - --- STEP 1: STARTING DOWNLOAD ---
+2025-11-18 10:49:08,069 - INFO - Report ID: 666 - Attempting to find files for 'November 2025'...
+2025-11-18 10:49:10,097 - INFO - Report ID: 666 - Attempting to download: https://www.fanniemae.com/media/document/pdf/economic-forecast-112025
+2025-11-18 10:49:13,173 - WARNING - Report ID: 666 -   File not found (404).
+2025-11-18 10:49:15,105 - INFO - Report ID: 666 - Rolling back to 'October 2025' for Economic file...
+2025-11-18 10:49:17,015 - INFO - Report ID: 666 - Attempting to download: https://www.fanniemae.com/media/document/pdf/economic-forecast-102025
+2025-11-18 10:49:20,248 - INFO - Report ID: 666 -   Success! Saved to: c:\Scripting\economic-forecast-latest.pdf
+2025-11-18 10:49:22,320 - INFO - Report ID: 666 - Attempting to download: https://www.fanniemae.com/media/document/pdf/housing-forecast-112025
+2025-11-18 10:49:31,781 - INFO - Report ID: 666 - Connected to Google BigQuery.
+2025-11-18 10:49:33,919 - INFO - Report ID: 666 - --- Starting FRED Forecast Script (Report ID: 666) ---
+2025-11-18 10:49:35,833 - INFO - Report ID: 666 - Using target file directory: c:\Scripting
+2025-11-18 10:49:37,826 - INFO - Report ID: 666 - --- STEP 1: STARTING DOWNLOAD ---
+2025-11-18 10:49:39,813 - INFO - Report ID: 666 - Attempting to find files for 'November 2025'...
+2025-11-18 10:49:41,796 - INFO - Report ID: 666 - Attempting to download: https://www.fanniemae.com/media/document/pdf/economic-forecast-112025
+2025-11-18 10:49:44,319 - WARNING - Report ID: 666 -   File not found (404).
+2025-11-18 10:49:46,274 - INFO - Report ID: 666 - Rolling back to 'October 2025' for Economic file...
+2025-11-18 10:49:48,415 - INFO - Report ID: 666 - Attempting to download: https://www.fanniemae.com/media/document/pdf/economic-forecast-102025
+2025-11-18 10:49:51,362 - INFO - Report ID: 666 -   Success! Saved to: c:\Scripting\economic-forecast-latest.pdf
+2025-11-18 10:49:53,394 - INFO - Report ID: 666 - Attempting to download: https://www.fanniemae.com/media/document/pdf/housing-forecast-112025
+2025-11-18 10:49:56,383 - WARNING - Report ID: 666 -   File not found (404).
+2025-11-18 10:49:58,562 - INFO - Report ID: 666 - Rolling back to 'October 2025' for Housing file...
+2025-11-18 10:50:00,529 - INFO - Report ID: 666 - Attempting to download: https://www.fanniemae.com/media/document/pdf/housing-forecast-102025
+2025-11-18 10:50:03,611 - INFO - Report ID: 666 -   Success! Saved to: c:\Scripting\housing-forecast-latest.pdf
+2025-11-18 10:50:05,629 - INFO - Report ID: 666 - --- STEP 1: DOWNLOAD COMPLETE ---
+2025-11-18 10:50:07,619 - INFO - Report ID: 666 - --- STEP 2: STARTING EXTRACTION ---
+2025-11-18 10:50:09,782 - INFO - Report ID: 666 - Found 'as of' date: 2025-10-13
+2025-11-18 10:50:11,734 - INFO - Report ID: 666 - Forecast starting quarter is: 25.4
+2025-11-18 10:50:13,799 - INFO - Report ID: 666 - Dynamically found 5-quarter forecast range: 25 Q4 to 26 Q4
+2025-11-18 10:50:15,830 - INFO - Report ID: 666 - Successfully extracted metric: Unemployment Rate
+2025-11-18 10:50:17,810 - INFO - Report ID: 666 - Successfully extracted metric: Federal Funds Rate
+2025-11-18 10:50:19,790 - INFO - Report ID: 666 - Successfully extracted metric: New Single-Family
+2025-11-18 10:50:21,761 - INFO - Report ID: 666 - Successfully extracted metric: 30-Year Fixed Rate Mortgage
+2025-11-18 10:50:23,819 - INFO - Report ID: 666 - --- STEP 2: EXTRACTION COMPLETE ---
+2025-11-18 10:50:25,808 - INFO - Report ID: 666 - --- STEP 3: STARTING MONTHLY BREAKDOWN ---
+2025-11-18 10:50:27,767 - INFO - Report ID: 666 - Starting monthly disaggregation...
+2025-11-18 10:50:29,970 - INFO - Report ID: 666 - Monthly disaggregation complete.
+2025-11-18 10:50:32,053 - INFO - Report ID: 666 - Added 'Forecast_Date' column with value 2025-10-13
+2025-11-18 10:50:34,302 - INFO - Report ID: 666 - --- STEP 5A: LOCAL BACKUP SAVED ---
+2025-11-18 10:50:36,307 - INFO - Report ID: 666 - Successfully saved local copy to c:\Scripting\FannieMae_Monthly_Forecast.xlsx
+2025-11-18 10:50:38,313 - INFO - Report ID: 666 - --- STEP 6: UPLOADING TO BIGQUERY ---
+2025-11-18 10:50:40,346 - INFO - Report ID: 666 - Explicitly set pandas_gbq credentials from: C:\GBQ\taxbi-app-bq-cxwfm-sa-clgx-taxbi-reg-bf03.json
+2025-11-18 10:50:42,282 - INFO - Report ID: 666 - Uploading 15 rows to clgx-taxbi-reg-bf03.tax_clnt_svcs.fred_fx...
+2025-11-18 10:50:44,325 - ERROR - Report ID: 666 - too many values to unpack (expected 2)
+2025-11-18 10:50:46,256 - ERROR - Report ID: 666 - Failed to fetch gbq schema info
+2025-11-18 10:50:48,203 - ERROR - Report ID: 666 - An unhandled error occurred: BigQueryManager failed to upload data. See logs for details.
+
+Traceback:
+Traceback (most recent call last):
+  File "c:\WFM_Scripting\Automation\fred_forecast.py", line 334, in <module>
+    main()
+  File "c:\WFM_Scripting\Automation\fred_forecast.py", line 307, in main
+    raise RuntimeError("BigQueryManager failed to upload data. See logs for details.")
+RuntimeError: BigQueryManager failed to upload data. See logs for details.
+
+2025-11-18 10:50:50,201 - ERROR - Report ID: 666 - Script Failure: Report ID 666: BigQueryManager failed to upload data. See logs for details.
+2025-11-18 10:50:53,244 - INFO - Report ID: 666 - Connected to Exchange account successfully.
+2025-11-18 10:50:56,158 - INFO - Report ID: 666 - Email sent successfully.
+
         )
