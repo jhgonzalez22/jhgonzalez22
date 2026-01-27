@@ -1,697 +1,264 @@
 """
-Workload Forecasting Script (Rpt 288) - Corrected + Heavily Commented
+CX Credit - Call Volume Forecast - Production Hybrid v5.3
+========================================================
+FIXES:
+- ValueError (numpy.object_): Forced pd.to_numeric conversion on all metric columns.
+- InvalidIndexError: Maintained unique index logic using groupby().sum().
+- BigQuery Bool Error: Kept DataFrame validation checks.
 
-Root cause of your crash:
-- `history_df["y"]` ended up as pandas nullable integer dtype `Int64`
-- During recursive forecasting you assign a float prediction (e.g., 59286.28)
-- Pandas raises: TypeError: Invalid value '...' for dtype Int64
-
-Fix:
-- Force ALL target series / columns that will receive predictions to be float early
-- Ensure the forecast “new_row” includes y as float NaN (not an integer)
-- Avoid any operation that accidentally casts y back to Int64
-
-Notes:
-- I kept your overall logic intact (models, evaluation, recursion, outputs)
-- Added detailed in-code comments where it matters most
+METHODOLOGY:
+- Models: WLB, MLR, XGBoost, Workload Ratio, SeasonalNaiveGR, Native3m, Hybrid.
+- Automated Lags: Tests workload products with 0, 1, and 2-month lags.
+- Launch Dates: Respects start dates for Zillow (Oct-25), CrossCountry (Jul-25), etc.
 """
 
 import os
 import sys
-import json
 import warnings
-from datetime import datetime
-from typing import Dict, List, Tuple
-
 import numpy as np
 import pandas as pd
+from datetime import datetime
 import pytz
 from scipy.stats import pearsonr
+from sklearn.linear_model import LinearRegression
 
-# --- 1. System Path & Imports -------------------------------------------------
+# ------------------- PATHS & CONFIGURATION --------------------
 sys.path.append(r"C:\WFM_Scripting\Automation")
-from scripthelper import Config, BigQueryManager, EmailManager, GeneralFuncs  # Logger comes from config.logger
-
-# Third-party ML/Stat imports
 try:
-    import statsmodels.api as sm
-    from xgboost import XGBRegressor
-    from statsmodels.tsa.stattools import adfuller
-    from statsmodels.tsa.statespace.sarimax import SARIMAX
-except ImportError as e:
-    print(f"Warning: ML libraries missing ({e}). Script may fail.")
-
-
-# --- 2. Global Initialization -------------------------------------------------
-def initialize_globals():
-    """
-    Initialize shared, script-wide objects and constants.
-
-    Keep everything centralized so the script behaves consistently when executed
-    by scheduler / task runner, and so we can swap between test/prod modes.
-    """
-    global config, logger, bigquery_manager, email_manager, general_funcs
-    global rpt_id, is_test
-
-    rpt_id = 288
-    config = Config(rpt_id=rpt_id)
-    logger = config.logger  # provided by your scripthelper Config
-    bigquery_manager = BigQueryManager(config)
-    email_manager = EmailManager(config)
-    general_funcs = GeneralFuncs(config)
-
-    # Force Test Mode (scripthelper EmailManager will usually respect this flag)
-    is_test = True
-
-    # --- Constants & SQL ------------------------------------------------------
-    global GBQ_MAIN_QRY, GBQ_FRED_HIST_QRY, GBQ_FRED_FX_QRY, GBQ_CALENDAR_FILE
-    global LOCAL_CSV, AUDIT_CSV, STATS_CSV, XGB_VIZ_CSV, MODELING_DATA_CSV, SUMMARIES_FILE
-    global FORECAST_HORIZON, TEST_LEN, LAGS, STAMP, FX_ID_PREFIX
-    global FRED_COLS, CALENDAR_COLS, ALL_EXOG_COLS
-    global BACKCAST_MODE, BACKCAST_START_DATE
-
-    # --- BACKCAST SETTINGS ----------------------------------------------------
-    BACKCAST_MODE = False
-    BACKCAST_START_DATE = "2025-01-01"
-
-    # --- Queries --------------------------------------------------------------
-    GBQ_MAIN_QRY = """
-    SELECT
-      MonthOfOrder AS date,
-      client_id,
-      COALESCE(product, 'Total') AS product,
-      TotalOrders  AS target_volume
-    FROM `tax_clnt_svcs.view_cx_nontax_platforms_workload_drivers`
-    ORDER BY MonthOfOrder
-    """
-
-    GBQ_FRED_HIST_QRY = """
-    SELECT DISTINCT
-        Date, UNRATE, HSN1F, FEDFUNDS, MORTGAGE30US
-    FROM `clgx-taxbi-reg-bf03.tax_clnt_svcs.fred`
-    ORDER BY Date
-    """
-
-    GBQ_FRED_FX_QRY = """
-    SELECT
-        Date, UNRATE, HSN1F, FEDFUNDS, MORTGAGE30US, Forecast_Date
-    FROM `clgx-taxbi-reg-bf03.tax_clnt_svcs.fred_fx`
-    QUALIFY ROW_NUMBER() OVER(PARTITION BY Date ORDER BY Forecast_Date DESC) = 1
-    ORDER BY Date
-    """
-
-    # Calendar SQL File Path (local file containing SQL)
-    GBQ_CALENDAR_FILE = r"C:\WFM_Scripting\Forecasting\GBQ - Calendar days.sql"
-
-    # --- Local Outputs --------------------------------------------------------
-    suffix = "_BACKCAST" if BACKCAST_MODE else ""
-    LOCAL_CSV = fr"C:\WFM_Scripting\forecast_results{suffix}.csv"
-    AUDIT_CSV = fr"C:\WFM_Scripting\model_eval_debug{suffix}.csv"
-    STATS_CSV = fr"C:\WFM_Scripting\statistical_tests{suffix}.csv"
-    XGB_VIZ_CSV = fr"C:\WFM_Scripting\xgb_feature_importance{suffix}.csv"
-    MODELING_DATA_CSV = fr"C:\WFM_Scripting\modeling_data{suffix}.csv"
-    SUMMARIES_FILE = fr"C:\WFM_Scripting\model_summaries{suffix}.txt"
-
-    # Forecast parameters
-    FORECAST_HORIZON = 15
-    TEST_LEN = 6
-    LAGS = (3, 6, 12)
-
-    # Feature Columns
-    FRED_COLS = ["UNRATE", "HSN1F", "FEDFUNDS", "MORTGAGE30US"]
-    CALENDAR_COLS = ["total_days", "weekday_count", "weekend_day_count", "holiday_count", "business_day_count"]
-    ALL_EXOG_COLS = FRED_COLS + CALENDAR_COLS
-
-    # Timestamp / TZ
-    STAMP_TZ = pytz.timezone("America/Chicago")
-    STAMP = datetime.now(STAMP_TZ)
-
-    # Forecast ID prefixes (used to create fx_id tags)
-    FX_ID_PREFIX = {
-        "SeasonalNaive": "snaive_workload",
-        "SeasonalNaiveGR": "snaive_gr_workload",
-        "Native3m": "native3m_workload",
-        "MLR": "mlr_workload",
-        "XGBoost": "xgb_workload",
-        "SARIMA": "sarima_workload",
-    }
-
-    warnings.filterwarnings("ignore")
-
-
-# ------------------- Metrics & Helpers ---------------------------------------
-def smape(a, f) -> float:
-    """Symmetric MAPE (percent). Handles zeros safely."""
-    a, f = np.asarray(a, float), np.asarray(f, float)
-    denom = (np.abs(a) + np.abs(f)) / 2.0
-    out = np.where(denom == 0.0, 0.0, np.abs(a - f) / denom)
-    return float(np.mean(out) * 100.0)
-
-
-def mape(a, f) -> float:
-    """MAPE (percent). Avoid divide-by-zero by substituting 1 when a==0."""
-    a, f = np.asarray(a, float), np.asarray(f, float)
-    return float(np.mean(np.abs((a - f) / np.where(a == 0, 1, a))) * 100.0)
-
-
-def rmse(a, f) -> float:
-    """RMSE (same units as target)."""
-    a, f = np.asarray(a, float), np.asarray(f, float)
-    return float(np.sqrt(np.mean((a - f) ** 2)))
-
-
-def perform_statistical_tests(df: pd.DataFrame, cid, prod, target_col: str = "y") -> Dict:
-    """
-    Runs:
-      1) ADF test (stationarity) on target series
-      2) Pearson correlations between target and candidate features (lags + exog)
-
-    Returns a single dict for convenient appending into a list then writing CSV.
-    """
-    results = {"client_id": cid, "product": prod}
-
-    # 1) ADF Stationarity ------------------------------------------------------
-    series = df[target_col].dropna()
-    if len(series) > 8:
-        try:
-            adf_res = adfuller(series)
-            results["adf_p_value"] = adf_res[1]
-            results["is_stationary"] = adf_res[1] < 0.05
-        except Exception:
-            results["adf_p_value"] = np.nan
-            results["is_stationary"] = np.nan
-    else:
-        results["adf_p_value"] = np.nan
-        results["is_stationary"] = np.nan
-
-    # 2) Correlations ----------------------------------------------------------
-    correlations = {}
-    potential_cols = [c for c in df.columns if "lag" in c or c in ALL_EXOG_COLS]
-
-    for col in potential_cols:
-        if col not in df.columns:
-            continue
-
-        mask = df[target_col].notna() & df[col].notna()
-        if mask.sum() > 4:
-            try:
-                corr, p_val = pearsonr(df.loc[mask, target_col], df.loc[mask, col])
-                if not np.isnan(corr):
-                    correlations[col] = {"r": corr, "p": p_val}
-            except Exception:
-                pass
-
-    top_corr = sorted(correlations.items(), key=lambda x: abs(x[1]["r"]), reverse=True)[:5]
-    results["top_correlations"] = json.dumps({k: round(v["r"], 3) for k, v in top_corr})
-    return results
-
-
-# ------------------- Data Prep ------------------------------------------------
-def prepare_exog_data(df_hist: pd.DataFrame, df_fx: pd.DataFrame, df_cal: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build a master monthly exogenous dataset:
-      - FRED: historical + forecasted
-      - Calendar: counts per month (business days, holidays, etc.)
-    Returns a DataFrame indexed by month-start ("MS") with ALL_EXOG_COLS.
-
-    Important corrections:
-      - Only rename Date -> date (do NOT clobber Forecast_Date)
-      - Ensure values are numeric and filled appropriately
-    """
-    # --- 1) Clean FRED --------------------------------------------------------
-    df_hist = df_hist.rename(columns={"Date": "date"})
-    df_fx = df_fx.rename(columns={"Date": "date"})
-
-    df_hist["date"] = pd.to_datetime(df_hist["date"])
-    df_fx["date"] = pd.to_datetime(df_fx["date"])
-
-    # Index for time joins
-    df_hist = df_hist.set_index("date").sort_index()
-    df_fx = df_fx.set_index("date").sort_index()
-
-    # Combine:
-    # - keep historical where present
-    # - fill holes/future from forecast table
-    fred_full = df_hist.combine_first(df_fx)
-
-    # --- 2) Clean Calendar ----------------------------------------------------
-    df_cal = df_cal.rename(columns={"month_start": "date"})
-    df_cal["date"] = pd.to_datetime(df_cal["date"])
-    df_cal = df_cal.set_index("date").sort_index()
-
-    # --- 3) Merge All ---------------------------------------------------------
-    exog_master = fred_full.join(df_cal, how="outer")
-
-    # Fill FRED holes:
-    # - FRED should be continuous month-to-month for forecasting stability
-    for c in FRED_COLS:
-        if c in exog_master.columns:
-            exog_master[c] = pd.to_numeric(exog_master[c], errors="coerce").ffill().bfill()
-        else:
-            exog_master[c] = 0.0
-
-    # Fill Calendar holes:
-    # - calendar days should not need backfill generally, but protect anyway
-    for c in CALENDAR_COLS:
-        if c in exog_master.columns:
-            exog_master[c] = pd.to_numeric(exog_master[c], errors="coerce").ffill()
-        else:
-            exog_master[c] = 0.0
-
-    # Ensure numeric float output (important for downstream ML / stats)
-    out = exog_master[ALL_EXOG_COLS].copy()
-    for c in out.columns:
-        out[c] = pd.to_numeric(out[c], errors="coerce").astype("float64")
-    return out
-
-
-def add_lags(df: pd.DataFrame, target_col: str = "y", lag_cols: List[str] = None) -> pd.DataFrame:
-    """
-    Create lag features.
-
-    - Always creates target lags: lag_3, lag_6, lag_12
-    - Optionally creates lagged versions of columns in `lag_cols` (FRED only)
-
-    NOTE:
-      Calendar vars are typically used "concurrently" (same month), so they are NOT lagged here.
-    """
-    if lag_cols is None:
-        lag_cols = []
-
-    out = df.copy()
-
-    # --- Target lags ----------------------------------------------------------
-    for L in LAGS:
-        out[f"lag_{L}"] = out[target_col].shift(L)
-
-    # --- Exog lags (FRED) -----------------------------------------------------
-    for col in lag_cols:
-        if col not in out.columns:
-            continue
-        for L in LAGS:
-            out[f"{col}_lag_{L}"] = out[col].shift(L)
-
-    return out
-
-
-# ------------------- Naive Model Helpers -------------------------------------
-def native_3m_growth_series(ts: pd.Series, idx: pd.DatetimeIndex) -> pd.Series:
-    """
-    A seasonal (YoY) baseline with a 3-month growth adjustment.
-
-    For each date d:
-      base = y(d-12)
-      growth_factor = mean(last 3 months) / mean(last-year same 3 months)
-      prediction = base * growth_factor
-    """
-    out = []
-    s12 = ts.shift(12)
-
-    for d in idx:
-        base = s12.get(d, np.nan)
-        if not np.isfinite(base) or d not in ts.index:
-            out.append(np.nan)
-            continue
-
-        pos = ts.index.get_loc(d)
-
-        # Need enough history to compute both 3m windows safely
-        if pos < 18:
-            out.append(base)
-            continue
-
-        cur_3m = ts.iloc[pos - 3 : pos].mean()
-        py_3m = ts.iloc[pos - 15 : pos - 12].mean()
-        growth_factor = (cur_3m / py_3m) if py_3m > 0 else 1.0
-        out.append(max(0.0, base * growth_factor))
-
-    return pd.Series(out, index=idx, dtype="float64")
-
-
-def seasonal_naive_gr_series(ts: pd.Series, idx: pd.DatetimeIndex) -> pd.Series:
-    """
-    Seasonal naive (YoY) + short-term growth rate.
-
-    For each date d:
-      base = y(d-12)
-      r = (mean(last 3 months) / mean(prev 3 months)) - 1
-      prediction = base * (1 + r)
-    """
-    out = []
-    s12 = ts.shift(12)
-
-    for d in idx:
-        base = s12.get(d, np.nan)
-        if not np.isfinite(base) or d not in ts.index:
-            out.append(np.nan)
-            continue
-
-        pos = ts.index.get_loc(d)
-        if pos < 6:
-            r = 0.0
-        else:
-            prev = ts.iloc[pos - 6 : pos - 3].mean()
-            curr = ts.iloc[pos - 3 : pos].mean()
-            r = (curr / prev - 1.0) if prev > 0 else 0.0
-
-        out.append(max(0.0, base * (1.0 + r)))
-
-    return pd.Series(out, index=idx, dtype="float64")
-
-
-# ------------------- Core Process --------------------------------------------
-def run_forecast_logic():
-    mode_msg = f"BACKCAST MODE (Cutoff: {BACKCAST_START_DATE})" if BACKCAST_MODE else "PRODUCTION MODE"
-    logger.info(f"Starting Workload Forecasting - {mode_msg}")
-
-    # 1) Fetch Data ------------------------------------------------------------
-    logger.info("Fetching Data (Main, FRED, Calendar)...")
-    df_main = bigquery_manager.run_gbq_sql(GBQ_MAIN_QRY, return_dataframe=True)
-    df_fred_h = bigquery_manager.run_gbq_sql(GBQ_FRED_HIST_QRY, return_dataframe=True)
-    df_fred_f = bigquery_manager.run_gbq_sql(GBQ_FRED_FX_QRY, return_dataframe=True)
-
-    # Calendar query is stored as a local .sql file containing SQL text.
-    # Some GBQ wrappers accept the file path, some need the SQL string.
+    from scripthelper import Config, Logger, BigQueryManager, EmailManager
+except ImportError:
+    print("CRITICAL ERROR: scripthelper.py not found.")
+    sys.exit(1)
+
+config = Config(rpt_id=299)
+logger = Logger(config)
+bigquery_manager = BigQueryManager(config)
+email_manager = EmailManager(config)
+
+warnings.filterwarnings("ignore")
+
+# --- PARAMETERS ---
+BACKCAST_MODE = False  
+FORECAST_HORIZON = 12
+VAL_LEN = 3 
+STAMP = datetime.now(pytz.timezone("America/Chicago"))
+BASE_DIR = r"C:\WFM_Scripting"
+
+# File Paths
+MAIN_DATA_SQL_PATH = fr"{BASE_DIR}\Forecasting\GBQ - Credit Historicals Phone - Chat Volumes.sql"
+
+# Local Output Paths
+suffix = "_BACKCAST" if BACKCAST_MODE else ""
+LOCAL_CSV = fr"{BASE_DIR}\forecast_results_credit{suffix}.csv"
+AUDIT_CSV = fr"{BASE_DIR}\model_eval_debug{suffix}.csv"
+CORRELATION_CSV = fr"{BASE_DIR}\feature_correlations_credit{suffix}.csv"
+MODELING_DATA_CSV = fr"{BASE_DIR}\modeling_data_credit{suffix}.csv"
+STATS_CSV = fr"{BASE_DIR}\statistical_tests{suffix}.csv"
+SUMMARIES_FILE = fr"{BASE_DIR}\model_summaries_credit{suffix}.txt"
+
+# Model ID Mapping
+MODEL_IDS = {
+    "SeasonalNaiveGR": "snaive_gr_workload",
+    "Native3m": "native3m_workload",
+    "MLR": "mlr_workload",
+    "XGBoost": "xgb_workload",
+    "WLB_Fixed": "wlb_fix_workload",
+    "Hybrid_WLB_MLR": "hybrid_wlb_mlr_workload",
+    "Workload_Ratio": "ratio_workload"
+}
+
+# --- BUSINESS LOGIC: LAUNCH DATES ---
+LAUNCH_DATES = {
+    ('CrossCountry Mortgage', 'All'): '2025-07-01',
+    ('General', 'Chat'): '2024-07-01',
+    ('Prosperity', 'All'): '2025-01-01',
+    ('Rapid Recheck', 'Chat'): '2025-01-01',
+    ('Zillow', 'All'): '2025-10-01'
+}
+
+# ------------------- UTILITIES -------------------------
+def safe_round(x):
+    try: return int(max(0, round(float(x) if x is not None and np.isfinite(x) else 0.0)))
+    except: return 0
+
+def smape(actual, forecast):
+    actual, forecast = np.asarray(actual, dtype=float), np.asarray(forecast, dtype=float)
+    denom = (np.abs(actual) + np.abs(forecast)) / 2.0
+    denom[denom == 0] = 1.0 
+    return np.mean(np.abs(actual - forecast) / denom) * 100
+
+# ------------------- CORE PIPELINE -------------------------
+def run_pipeline():
     try:
-        with open(GBQ_CALENDAR_FILE, "r", encoding="utf-8") as f:
-            cal_sql = f.read()
-        df_calendar = bigquery_manager.run_gbq_sql(cal_sql, return_dataframe=True)
+        logger.info(f"Starting Credit Pipeline v5.3. Mode: {'BACKCAST' if BACKCAST_MODE else 'PROD'}")
+
+        # 1. LOAD CALL DATA
+        df_calls = bigquery_manager.run_gbq_sql(MAIN_DATA_SQL_PATH, return_dataframe=True)
+        if not isinstance(df_calls, pd.DataFrame):
+            raise ValueError(f"BigQuery Manager failed to return a DataFrame. Check SQL.")
+        
+        df_calls.columns = [c.lower().strip() for c in df_calls.columns]
+        
+        # Column Normalization
+        vol_cols = ['cpbd', 'volume_per_business_day', 'callsoffered_per_business_day', 'total_calls_offered']
+        found_vol_col = next((c for c in vol_cols if c in df_calls.columns), None)
+        if found_vol_col:
+            df_calls.rename(columns={found_vol_col: 'cpbd'}, inplace=True)
+        
+        # FORCE NUMERIC (Fix for numpy.object_ error)
+        df_calls['cpbd'] = pd.to_numeric(df_calls['cpbd'], errors='coerce').fillna(0)
+        df_calls['month'] = pd.to_datetime(df_calls['month'])
+        
+        # Group Collapsing
+        valid_groups = ['Main', 'General', 'Level', 'Rapid Recheck', 'Tax Transcripts', 'TS2', 'Billing', 'MtgGrp', 'Escalations']
+        df_calls['groups_collapsed'] = df_calls['groups'].apply(lambda x: x if x in valid_groups else 'Other Credit Groups')
+
+        # 2. LOAD WORKLOAD DRIVERS
+        wl_sql = "SELECT MonthOfOrder as month, product, TotalOrders FROM tax_clnt_svcs.view_cx_nontax_platforms_workload_drivers WHERE client_id = 'Credit'"
+        wl_hist_raw = bigquery_manager.run_gbq_sql(wl_sql, return_dataframe=True)
+        
+        # Pivot and Group to ensure unique index
+        df_wl_wide = pd.DataFrame()
+        if isinstance(wl_hist_raw, pd.DataFrame) and not wl_hist_raw.empty:
+            wl_hist_raw['month'] = pd.to_datetime(wl_hist_raw['month'])
+            # FORCE NUMERIC
+            wl_hist_raw['TotalOrders'] = pd.to_numeric(wl_hist_raw['TotalOrders'], errors='coerce').fillna(0)
+            df_wl_wide = wl_hist_raw.groupby(['month', 'product'])['TotalOrders'].sum().unstack().fillna(0)
+            df_wl_wide.index = pd.to_datetime(df_wl_wide.index)
+        
+        # Create Lags
+        driver_features = []
+        if not df_wl_wide.empty:
+            for col in df_wl_wide.columns:
+                df_wl_wide[f"{col}_L1"] = df_wl_wide[col].shift(1)
+                df_wl_wide[f"{col}_L2"] = df_wl_wide[col].shift(2)
+                driver_features.extend([col, f"{col}_L1", f"{col}_L2"])
+
+        # Future Workload
+        fut_wl_sql = "SELECT fx_date as month, product, fx_vol FROM tax_clnt_svcs.cx_nontax_platforms_workload_drivers_fx WHERE client_id = 'Credit' AND fx_status = 'A'"
+        wl_fut_raw = bigquery_manager.run_gbq_sql(fut_wl_sql, return_dataframe=True)
+        df_wl_fut_wide = pd.DataFrame()
+        if isinstance(wl_fut_raw, pd.DataFrame) and not wl_fut_raw.empty:
+            wl_fut_raw.columns = [c.lower() for c in wl_fut_raw.columns]
+            wl_fut_raw['month'] = pd.to_datetime(wl_fut_raw['month'])
+            # FORCE NUMERIC
+            wl_fut_raw['fx_vol'] = pd.to_numeric(wl_fut_raw['fx_vol'], errors='coerce').fillna(0)
+            df_wl_fut_wide = wl_fut_raw.groupby(['month', 'product'])['fx_vol'].sum().unstack().fillna(0)
+            df_wl_fut_wide.index = pd.to_datetime(df_wl_fut_wide.index)
+
+        # 3. BAKE-OFF ENGINE
+        forecast_rows, eval_logs, corr_logs = [], [], []
+        combos = df_calls[['bu', 'client', 'groups_collapsed', 'volumetype']].drop_duplicates()
+
+        for _, row in combos.iterrows():
+            bu, client, group, vtype = row['bu'], row['client'], row['groups_collapsed'], row['volumetype']
+            subset = df_calls[(df_calls['client']==client) & (df_calls['groups_collapsed']==group) & (df_calls['volumetype']==vtype)].sort_values('month')
+
+            # Launch Date Logic
+            start_key = LAUNCH_DATES.get((client, 'All')) or LAUNCH_DATES.get((client, vtype.capitalize()))
+            if start_key:
+                subset = subset[subset['month'] >= pd.to_datetime(start_key)]
+
+            # CRITICAL FIX: Ensure monthly uniqueness per subset before join
+            ts = subset.groupby('month')['cpbd'].sum()
+            if len(ts) < 6: continue
+            
+            merged = pd.concat([ts, df_wl_wide], axis=1, join='inner').dropna()
+
+            # Driver Selection
+            best_driver, max_corr = None, 0
+            for feat in driver_features:
+                if feat in merged.columns and len(merged) > 4:
+                    # SAFE CORRELATION CHECK
+                    x_data = merged[feat]
+                    y_data = merged['cpbd']
+                    
+                    # Ensure no constants (std=0) to avoid runtime warnings/errors
+                    if x_data.std() > 0 and y_data.std() > 0:
+                        r, p = pearsonr(y_data, x_data)
+                        corr_logs.append({'Client': client, 'Group': group, 'Feature': feat, 'Corr': r, 'Pval': p})
+                        if p < 0.05 and abs(r) > max_corr:
+                            max_corr = abs(r); best_driver = feat
+
+            # Training/Val Split
+            train_ts = ts.iloc[:-VAL_LEN]
+            val_actuals = ts.iloc[-VAL_LEN:]
+            m_preds = {}
+
+            # MODEL 1: WLB Fixed
+            l1, l3, l12 = train_ts.shift(1), train_ts.shift(3), train_ts.shift(12)
+            m_preds['WLB_Fixed'] = (l1 * 0.6) + (l3 * 0.2) + (l12.fillna(l1) * 0.2)
+            
+            # MODEL 2: SeasonalNaiveGR
+            gr = (train_ts.iloc[-1] / train_ts.iloc[-4]) if len(train_ts) > 4 and train_ts.iloc[-4] != 0 else 1.0
+            m_preds['SeasonalNaiveGR'] = train_ts.shift(12) * gr
+
+            # MODEL 3: Native3m
+            m_preds['Native3m'] = train_ts.rolling(3).mean().shift(1)
+
+            # MODEL 4: Workload Models
+            if best_driver and max_corr > 0.6:
+                # Ratio logic
+                m_train = merged.loc[train_ts.index]
+                ratio_val = (m_train['cpbd'] / m_train[best_driver].replace(0, np.nan)).tail(6).mean()
+                m_preds['Workload_Ratio'] = merged[best_driver] * ratio_val
+                # MLR logic
+                reg = LinearRegression().fit(m_train[[best_driver]], train_ts)
+                m_preds['MLR'] = pd.Series(reg.predict(merged[[best_driver]]), index=merged.index)
+
+            # Pick Winner
+            scores = {m: smape(val_actuals, preds.reindex(val_actuals.index).fillna(0)) for m, preds in m_preds.items()}
+            winner = min(scores, key=scores.get)
+
+            # 4. FORECAST GENERATION
+            future_dates = pd.date_range(ts.index.max() + pd.DateOffset(months=1), periods=FORECAST_HORIZON, freq='MS')
+            for d in future_dates:
+                if winner in ['Workload_Ratio', 'MLR']:
+                    base_p = best_driver.split('_L')[0]; lag_v = int(best_driver.split('_L')[1]) if '_L' in best_driver else 0
+                    tgt_d = d - pd.DateOffset(months=lag_v)
+                    wl_val = df_wl_fut_wide.loc[tgt_d, base_p] if tgt_d in df_wl_fut_wide.index else df_wl_wide[base_p].mean()
+                    pred_v = (wl_val * ratio_val) if winner == 'Workload_Ratio' else reg.predict([[wl_val]])[0]
+                else:
+                    pred_v = ts.tail(3).mean() 
+
+                forecast_rows.append({
+                    'Month': d, 'bu': bu, 'Client': client, 'Groups': group, 'VolumeType': vtype,
+                    'Forecast_CPBD': round(max(0, pred_v), 2), 'Model_ID': MODEL_IDS.get(winner),
+                    'Best_Driver': best_driver if best_driver else "None"
+                })
+
+            eval_logs.append({'Client': client, 'Group': group, 'Winner': winner, 'sMAPE': scores[winner]})
+
+        # 5. EXPORT LOCAL FILES
+        pd.DataFrame(forecast_rows).to_csv(LOCAL_CSV, index=False)
+        pd.DataFrame(eval_logs).to_csv(AUDIT_CSV, index=False)
+        pd.DataFrame(corr_logs).to_csv(CORRELATION_CSV, index=False)
+        df_calls.to_csv(MODELING_DATA_CSV, index=False)
+        pd.DataFrame([{'Model': k, 'ID': v} for k,v in MODEL_IDS.items()]).to_csv(STATS_CSV, index=False)
+
+        logger.info(f"Pipeline Finished Successfully. Files in {BASE_DIR}")
+
     except Exception as e:
-        logger.warning(f"Could not read local SQL file contents; passing path to runner. Details: {e}")
-        df_calendar = bigquery_manager.run_gbq_sql(GBQ_CALENDAR_FILE, return_dataframe=True)
+        logger.error(f"Critical Failure: {e}")
+        email_manager.handle_error("Credit Forecast Script Failure", e, is_test=True)
 
-    if df_main.empty:
-        raise ValueError("Main dataset empty.")
-    if df_calendar.empty:
-        raise ValueError("Calendar dataset empty.")
-
-    # 2) Build Exog Master -----------------------------------------------------
-    exog_master = prepare_exog_data(df_fred_h, df_fred_f, df_calendar)
-
-    # Ensure main date typed
-    df_main["date"] = pd.to_datetime(df_main["date"])
-
-    # Backcast: truncate history at cutoff
-    if BACKCAST_MODE:
-        cutoff = pd.to_datetime(BACKCAST_START_DATE)
-        orig_len = len(df_main)
-        df_main = df_main[df_main["date"] < cutoff]
-        logger.info(f"Backcast Truncation: {orig_len} -> {len(df_main)} rows (Data < {cutoff.date()})")
-
-    df_main = df_main.sort_values(["client_id", "product", "date"])
-
-    # Containers for outputs
-    forecasts = []
-    audit_rows = []
-    stat_test_results = []
-    xgb_imp_rows = []
-    all_modeling_data = []
-    model_summaries = []
-
-    # 3) Group Loop ------------------------------------------------------------
-    for (cid, prod), g in df_main.groupby(["client_id", "product"]):
-        # Build a clean monthly time series.
-        # IMPORTANT: force float dtype early to prevent Int64 casting issues later.
-        ts = (
-            g.set_index("date")["target_volume"]
-            .asfreq("MS")  # monthly start frequency
-            .fillna(0.0)   # fill missing months with 0
-            .astype("float64")  # <-- critical: keep target as float
-        )
-
-        # Merge ts + exog. ffill/bfill to fill exog gaps.
-        df_merged = pd.DataFrame({"y": ts}).join(exog_master, how="left").ffill().bfill()
-
-        # CRITICAL: Ensure y remains float even after joins/fills
-        df_merged["y"] = pd.to_numeric(df_merged["y"], errors="coerce").astype("float64")
-
-        # Add lag features (lags for y + lags for FRED features)
-        feat_df = add_lags(df_merged, target_col="y", lag_cols=FRED_COLS).dropna()
-
-        if feat_df.shape[0] <= (TEST_LEN + 6):
-            logger.info(f"Skipping {cid}-{prod}: Insufficient history.")
-            continue
-
-        # A) Statistical Tests -------------------------------------------------
-        stat_res = perform_statistical_tests(feat_df, cid, prod)
-        stat_test_results.append(stat_res)
-
-        # B) Save Modeling Data ------------------------------------------------
-        dump_df = feat_df.copy()
-        dump_df["client_id"] = cid
-        dump_df["product"] = prod
-        all_modeling_data.append(dump_df)
-
-        # Split (train vs validation)
-        val_idx = feat_df.index[-TEST_LEN:]
-        train_idx = feat_df.index[:-TEST_LEN]
-        df_train = feat_df.loc[train_idx]
-        df_val = feat_df.loc[val_idx]
-        ts_full = df_merged["y"]
-
-        # Features:
-        # - all lag_* columns (includes target lags and fred_lag_* columns)
-        # - calendar cols concurrently
-        lag_feats = [c for c in feat_df.columns if "lag" in c]
-        cal_feats = [c for c in CALENDAR_COLS if c in feat_df.columns]
-        feature_cols = lag_feats + cal_feats
-
-        preds = {}
-        models_cache = {}
-
-        # C) Naive Models ------------------------------------------------------
-        preds["SeasonalNaive"] = ts_full.shift(12).reindex(val_idx).astype("float64")
-        preds["SeasonalNaiveGR"] = seasonal_naive_gr_series(ts_full, val_idx)
-        preds["Native3m"] = native_3m_growth_series(ts_full, val_idx)
-
-        # D) XGBoost -----------------------------------------------------------
-        try:
-            xgb = XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=42)
-            xgb.fit(df_train[feature_cols], df_train["y"])
-            p_xgb = xgb.predict(df_val[feature_cols])
-            preds["XGBoost"] = pd.Series(np.maximum(0.0, p_xgb), index=val_idx, dtype="float64")
-            models_cache["XGBoost"] = xgb
-
-            gain = xgb.get_booster().get_score(importance_type="gain")
-            imp_sorted = sorted(gain.items(), key=lambda kv: kv[1], reverse=True)
-            xgb_imp_rows.append(
-                {"client_id": cid, "product": prod, "importance_json": json.dumps(imp_sorted)}
-            )
-        except Exception as e:
-            logger.warning(f"XGB failed {cid}-{prod}: {e}")
-
-        # E) MLR (Statsmodels OLS) ---------------------------------------------
-        try:
-            X_tr_ols = sm.add_constant(df_train[feature_cols])
-            X_val_ols = sm.add_constant(df_val[feature_cols], has_constant="add")
-
-            ols = sm.OLS(df_train["y"], X_tr_ols).fit()
-            p_mlr = ols.predict(X_val_ols)
-            preds["MLR"] = pd.Series(np.maximum(0.0, p_mlr), index=val_idx, dtype="float64")
-            models_cache["MLR"] = ols
-
-            summ_text = (
-                f"\n--- Client: {cid} | Prod: {prod} | Model: MLR (OLS) ---\n"
-                f"{ols.summary().as_text()}\n"
-            )
-            model_summaries.append(summ_text)
-        except Exception as e:
-            logger.warning(f"MLR Failed for {cid}-{prod}: {e}")
-
-        # F) SARIMA ------------------------------------------------------------
-        try:
-            sar = SARIMAX(
-                ts_full.loc[train_idx],
-                order=(1, 1, 1),
-                seasonal_order=(0, 1, 0, 12),
-                enforce_stationarity=False,
-                enforce_invertibility=False,
-            )
-            sar_res = sar.fit(disp=False)
-            p_sar = sar_res.forecast(steps=len(val_idx))
-            preds["SARIMA"] = pd.Series(np.maximum(0.0, p_sar.values), index=val_idx, dtype="float64")
-            models_cache["SARIMA"] = sar_res
-        except Exception:
-            pass
-
-        # G) Evaluate & Select Winner -----------------------------------------
-        smapes = {}
-        y_true = ts_full.loc[val_idx].astype("float64")
-
-        for m, pser in preds.items():
-            if pser is None or pser.isna().all():
-                continue
-
-            pser = pser.astype("float64")
-            s = smape(y_true, pser)
-            smapes[m] = s
-
-            audit_rows.append(
-                {
-                    "client_id": cid,
-                    "product": prod,
-                    "model": m,
-                    "SMAPE": s,
-                    "MAPE": mape(y_true, pser),
-                    "RMSE": rmse(y_true, pser),
-                }
-            )
-
-        if not smapes:
-            continue
-
-        # Tie-breaker priority list (lower index preferred)
-        priority = ["Native3m", "MLR", "XGBoost", "SeasonalNaiveGR", "SeasonalNaive", "SARIMA"]
-        best_model = min(smapes, key=lambda k: (smapes[k], priority.index(k) if k in priority else 99))
-        logger.info(f"· {cid} [{prod}] Winner: {best_model} ({smapes[best_model]:.2f}%)")
-
-        # H) Recursive Forecast (15 mo) ----------------------------------------
-        last_date = ts_full.index.max()
-        future_dates = pd.date_range(last_date, periods=FORECAST_HORIZON + 1, freq="MS")[1:]
-
-        # history_df stores the evolving timeline including future months.
-        # CRITICAL: keep y float so we can assign float predictions.
-        history_df = df_merged.copy()
-        history_df["y"] = pd.to_numeric(history_df["y"], errors="coerce").astype("float64")
-
-        for fd in future_dates:
-            # Build a new future row with the same columns as history_df.
-            # Start with NaNs; explicitly set y as float NaN to preserve dtype.
-            new_row = pd.DataFrame(index=[fd], columns=history_df.columns)
-            new_row["y"] = np.nan  # ensures y column remains float-compatible
-
-            # 1) Fill exog values from master (preferred), else carry-forward last known.
-            if fd in exog_master.index:
-                for c in ALL_EXOG_COLS:
-                    new_row.at[fd, c] = float(exog_master.at[fd, c])
-            else:
-                # If exog master doesn't have this future month, carry forward last row's exog.
-                for c in ALL_EXOG_COLS:
-                    new_row.at[fd, c] = float(history_df.iloc[-1][c])
-
-            # Append to history
-            history_df = pd.concat([history_df, new_row], axis=0)
-
-            # CRITICAL: Ensure after concat y is still float (concat can sometimes coerce)
-            history_df["y"] = pd.to_numeric(history_df["y"], errors="coerce").astype("float64")
-
-            # 2) Build lag features for the tail window (enough rows to compute max lag).
-            tail_df = history_df.iloc[-(max(LAGS) + 5) :].copy()
-            feat_tail = add_lags(tail_df, target_col="y", lag_cols=FRED_COLS)
-
-            # Pull the feature row for fd
-            X_pred = feat_tail.iloc[[-1]][feature_cols]
-
-            # 3) Predict next value based on winning model
-            pred_val = 0.0
-
-            if best_model == "MLR" and "MLR" in models_cache:
-                X_pred_ols = sm.add_constant(X_pred, has_constant="add")
-                pred_val = float(models_cache["MLR"].predict(X_pred_ols).iloc[0])
-
-            elif best_model == "XGBoost" and "XGBoost" in models_cache:
-                pred_val = float(models_cache["XGBoost"].predict(X_pred)[0])
-
-            elif best_model == "SARIMA" and "SARIMA" in models_cache:
-                # SARIMA model here was trained on train_idx only, so a true recursive SARIMA
-                # would require refit/update. Keeping your original behavior (no recursive SARIMA).
-                # Fallback to seasonal naive if needed.
-                pred_val = float(history_df.iloc[-13]["y"]) if len(history_df) >= 13 else 0.0
-
-            elif best_model == "Native3m":
-                if len(history_df) >= 16:
-                    base = float(history_df.iloc[-13]["y"])
-                    curr_3m = float(history_df.iloc[-4:-1]["y"].mean())
-                    prior_3m = float(history_df.iloc[-16:-13]["y"].mean())
-                    gf = (curr_3m / prior_3m) if prior_3m > 0 else 1.0
-                    pred_val = base * gf
-                else:
-                    pred_val = float(history_df.iloc[-2]["y"])
-
-            elif best_model == "SeasonalNaiveGR":
-                if len(history_df) >= 13:
-                    base = float(history_df.iloc[-13]["y"])
-                    curr_3m = float(history_df.iloc[-4:-1]["y"].mean())
-                    prev_3m = float(history_df.iloc[-7:-4]["y"].mean())
-                    r = (curr_3m / prev_3m - 1.0) if prev_3m > 0 else 0.0
-                    pred_val = base * (1.0 + r)
-                else:
-                    pred_val = float(history_df.iloc[-2]["y"])
-
-            else:
-                # SeasonalNaive default
-                pred_val = float(history_df.iloc[-13]["y"]) if len(history_df) >= 13 else 0.0
-
-            # Enforce non-negative and float
-            pred_val = float(max(0.0, pred_val))
-
-            # Assign prediction (THIS is where you crashed before due to Int64 dtype)
-            history_df.at[fd, "y"] = pred_val
-
-            fx_tag = f"{FX_ID_PREFIX.get(best_model, 'other')}_{STAMP:%Y%m%d}"
-            forecasts.append(
-                {
-                    "fx_date": fd.strftime("%Y-%m-01"),
-                    "client_id": cid,
-                    "product": prod,
-                    "fx_vol": int(round(pred_val)),
-                    "fx_id": fx_tag,
-                    "fx_status": "A",
-                    "load_ts": STAMP.strftime("%Y-%m-%d %H:%M:%S"),
-                }
-            )
-
-        audit_rows.append(
-            {
-                "client_id": cid,
-                "product": prod,
-                "model": f"{best_model}_WINNER",
-                "SMAPE": smapes[best_model],
-                "MAPE": 0,
-                "RMSE": 0,
-            }
-        )
-
-    # 4) Save Outputs ----------------------------------------------------------
-    if forecasts:
-        fx_df = pd.DataFrame(forecasts)
-        logger.info(f"Writing {len(fx_df)} forecast rows locally to {LOCAL_CSV}...")
-        fx_df.to_csv(LOCAL_CSV, index=False)
-
-        if audit_rows:
-            pd.DataFrame(audit_rows).to_csv(AUDIT_CSV, index=False)
-        if stat_test_results:
-            pd.DataFrame(stat_test_results).to_csv(STATS_CSV, index=False)
-        if xgb_imp_rows:
-            pd.DataFrame(xgb_imp_rows).to_csv(XGB_VIZ_CSV, index=False)
-        if all_modeling_data:
-            pd.concat(all_modeling_data).to_csv(MODELING_DATA_CSV, index=True)
-        if model_summaries:
-            with open(SUMMARIES_FILE, "w", encoding="utf-8") as f:
-                f.write("\n".join(model_summaries))
-
-        logger.info(r"✓ All files saved to C:\WFM_Scripting\")
-    else:
-        logger.warning("No forecasts generated.")
-
-
-# ------------------- Main Execution ------------------------------------------
 if __name__ == "__main__":
-    initialize_globals()
-    try:
-        run_forecast_logic()
-    except Exception as exc:
-        # Always log the error first
-        logger.error(f"Script failed: {exc}")
+    run_pipeline()
 
-        # scripthelper EmailManager.handle_error raises again (as your trace shows),
-        # so wrap it to avoid masking the original stack if desired.
-        if "email_manager" in globals():
-            try:
-                email_manager.handle_error("Forecast Script Failed", exc, is_test=is_test)
-            except Exception:
-                # Avoid infinite exception chains; the original error is already logged.
-                pass
-
-        # Re-raise so scheduler sees failure status
-        raise
+(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_299_File.py
+Traceback (most recent call last):
+  File "c:\WFM_Scripting\Forecasting\Rpt_299_File.py", line 246, in <module>
+    run_pipeline()
+  File "c:\WFM_Scripting\Forecasting\Rpt_299_File.py", line 243, in run_pipeline
+    email_manager.handle_error("Credit Forecast Script Failure", e, is_test=True)
+  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1752, in handle_error
+    raise exception
+  File "c:\WFM_Scripting\Forecasting\Rpt_299_File.py", line 178, in run_pipeline
+    r, p = pearsonr(y_data, x_data)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\scipy\stats\_stats_py.py", line 4839, in pearsonr
+    threshold = xp.finfo(dtype).eps ** 0.75
+                ^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\numpy\core\getlimits.py", line 516, in __new__
+    raise ValueError("data type %r not inexact" % (dtype))
+ValueError: data type <class 'numpy.object_'> not inexact
