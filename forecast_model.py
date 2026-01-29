@@ -1,576 +1,307 @@
 """
-CX Credit - Call Volume Forecast - Production Hybrid v5.4
-========================================================
-PURPOSE
-- Pulls Credit phone/chat historicals from BigQuery (via SQL file), merges with workload driver history + future FX.
-- Runs a simple bake-off per (BU, Client, Group, VolumeType) combo.
-- Exports forecast + audit files locally.
+CX Platforms Phone Forecast — v2.4.5
+=========================================
+Purpose: Forecasts monthly phone call volumes using a tournament of statistical 
+         and machine learning models.
+Features: 
+  - Normalizes target to 'Offered Per Business Day'.
+  - Integrates FRED Market Data (Mortgage Rates) as leading indicators.
+  - Integrates Workload Drivers (Orders) for Ratio-based modeling.
+  - Back-casts from 2025-01-01 for validation.
+  - Outputs detailed local audit files for analysis.
 
-WHAT'S NEW IN v5.4 (CRITICAL FIX)
-- pearsonr() dtype crash fix:
-  * Enforced numeric float dtypes on df_wl_wide / df_wl_fut_wide AFTER pivot/unstack.
-  * Enforced numeric float arrays immediately before pearsonr() (last line of defense).
-  * Handles NaNs + constant series safely before correlation.
+Fixes in v2.4.5:
+  - Fixed AttributeError in smape function (numpy array has no fillna).
+  - Enhanced NaN handling using np.nan_to_num.
 
-ASSUMPTIONS
-- You have scripthelper.py at: C:\WFM_Scripting\Automation\scripthelper.py
-- Your BigQuery SQL file exists at:
-  C:\WFM_Scripting\Forecasting\GBQ - Credit Historicals Phone - Chat Volumes.sql
-- Your BigQuery views/tables exist:
-  * tax_clnt_svcs.view_cx_nontax_platforms_workload_drivers
-  * tax_clnt_svcs.cx_nontax_platforms_workload_drivers_fx
+Author: Automation Team
+Last Updated: 2026-01-29
 """
 
 import os
 import sys
-import warnings
+import json
 import numpy as np
 import pandas as pd
 from datetime import datetime
-import pytz
+from xgboost import XGBRegressor
 
-# SciPy pearson correlation (we will guard inputs heavily)
-from scipy.stats import pearsonr
-
-# Simple regression model used for MLR workload model (single-feature)
-from sklearn.linear_model import LinearRegression
-
-# ------------------- PATHS & CONFIGURATION --------------------
-# Ensure scripthelper can be imported
+# Ensure this points to your automation folder
 sys.path.append(r"C:\WFM_Scripting\Automation")
 
-try:
-    from scripthelper import Config, Logger, BigQueryManager, EmailManager
-except ImportError:
-    print("CRITICAL ERROR: scripthelper.py not found at C:\\WFM_Scripting\\Automation")
-    sys.exit(1)
+from scripthelper import Config, Logger, BigQueryManager, EmailManager
 
-# Initialize config + core managers using your standard framework
-config = Config(rpt_id=299)
+# ------------------- 1. Configuration & File Paths -------------------
+config = Config(rpt_id=283)
 logger = Logger(config)
-bigquery_manager = BigQueryManager(config)
 email_manager = EmailManager(config)
+bq_manager = BigQueryManager(config)
 
-# Ignore noisy warnings for production runs (you can turn this off for debugging)
-warnings.filterwarnings("ignore")
-
-# ------------------- PARAMETERS --------------------
-BACKCAST_MODE = False            # If True, use suffix in outputs (logic not expanded here)
-FORECAST_HORIZON = 12            # Months ahead to forecast
-VAL_LEN = 3                      # Validation length (months) for model selection bake-off
-STAMP = datetime.now(pytz.timezone("America/Chicago"))
-
-BASE_DIR = r"C:\WFM_Scripting"
-
-# File Paths (historicals pulled via SQL file)
-MAIN_DATA_SQL_PATH = fr"{BASE_DIR}\Forecasting\GBQ - Credit Historicals Phone - Chat Volumes.sql"
+# SQL Query Paths
+SQL_QUERY_PATH = r"C:\WFM_Scripting\Forecasting\GBQ - Non-Tax Platform Phone Timeseries by Month.sql"
 
 # Local Output Paths
-suffix = "_BACKCAST" if BACKCAST_MODE else ""
-LOCAL_CSV = fr"{BASE_DIR}\forecast_results_credit{suffix}.csv"
-AUDIT_CSV = fr"{BASE_DIR}\model_eval_debug{suffix}.csv"
-CORRELATION_CSV = fr"{BASE_DIR}\feature_correlations_credit{suffix}.csv"
-MODELING_DATA_CSV = fr"{BASE_DIR}\modeling_data_credit{suffix}.csv"
-STATS_CSV = fr"{BASE_DIR}\statistical_tests{suffix}.csv"
-SUMMARIES_FILE = fr"{BASE_DIR}\model_summaries_credit{suffix}.txt"  # reserved for future text summaries
+LOCAL_CSV         = r"C:\WFM_Scripting\forecast_results_phone.csv"
+AUDIT_CSV         = r"C:\WFM_Scripting\model_eval_debug_phone.csv"
+STATS_CSV         = r"C:\WFM_Scripting\statistical_tests_phone.csv"
+XGB_VIZ_CSV       = r"C:\WFM_Scripting\xgb_feature_importance_phone.csv"
+MODELING_DATA_CSV = r"C:\WFM_Scripting\modeling_data_phone.csv"
+SUMMARIES_FILE    = r"C:\WFM_Scripting\model_summaries_phone.txt"
 
-# Model ID Mapping (what you push downstream / store as IDs)
-MODEL_IDS = {
-    "SeasonalNaiveGR": "snaive_gr_workload",
-    "Native3m": "native3m_workload",
-    "MLR": "mlr_workload",
-    "WLB_Fixed": "wlb_fix_workload",
-    "Workload_Ratio": "ratio_workload",
-    # Reserved / not implemented in this slim bakeoff
-    "XGBoost": "xgb_workload",
-    "Hybrid_WLB_MLR": "hybrid_wlb_mlr_workload",
-}
+# Forecasting Parameters
+BACKCAST_START = '2025-01-01'
+HORIZON = 15
+LAG1_MAX_WEIGHT = 0.60
+STAMP = datetime.now()
 
-# ------------------- BUSINESS LOGIC: LAUNCH DATES --------------------
-# If a client/volumetype started later than the full history, cut training data accordingly.
-# Keys are (client, 'All') or (client, 'Chat'/'Phone' etc. capitalized).
-LAUNCH_DATES = {
-    ('CrossCountry Mortgage', 'All'): '2025-07-01',
-    ('General', 'Chat'): '2024-07-01',
-    ('Prosperity', 'All'): '2025-01-01',
-    ('Rapid Recheck', 'Chat'): '2025-01-01',
-    ('Zillow', 'All'): '2025-10-01'
-}
-
-# ------------------- UTILITIES -------------------------
-def safe_round(x) -> int:
+# ------------------- 2. Helper Functions -------------------
+def smape(actual, forecast):
     """
-    Convert a value to a non-negative int safely.
-    Used if you want integer rounding for output; kept here for convenience.
+    Calculates Symmetric Mean Absolute Percentage Error (SMAPE).
+    FIX: Uses np.nan_to_num to handle NaNs safely for both arrays and series.
     """
-    try:
-        if x is None:
-            return 0
-        xf = float(x)
-        if not np.isfinite(xf):
-            return 0
-        return int(max(0, round(xf)))
-    except Exception:
-        return 0
+    # Force conversion to numeric, coerce errors to NaN
+    a = pd.to_numeric(actual, errors='coerce')
+    f = pd.to_numeric(forecast, errors='coerce')
+    
+    # Convert to numpy float array and replace NaN/Inf with 0
+    a = np.nan_to_num(np.array(a, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    f = np.nan_to_num(np.array(f, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    
+    denom = (np.abs(a) + np.abs(f)) / 2.0
+    
+    # Avoid division by zero
+    return np.mean(np.abs(a - f) / np.where(denom == 0, 1.0, denom)) * 100
 
+# ------------------- 3. Main Execution Pipeline -------------------
+try:
+    logger.info("Starting Pipeline v2.4.5 - Fixes applied...")
 
-def smape(actual, forecast) -> float:
+    # --- Step 3a: Fetch FRED Market Metrics (History + Forecast) ---
+    fred_sql = """
+    SELECT Date as date, UNRATE, HSN1F, FEDFUNDS, MORTGAGE30US 
+    FROM `clgx-taxbi-reg-bf03.tax_clnt_svcs.fred`
+    UNION ALL
+    SELECT Date as date, UNRATE, HSN1F, FEDFUNDS, MORTGAGE30US 
+    FROM `clgx-taxbi-reg-bf03.tax_clnt_svcs.fred_fx`
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY Date ORDER BY Forecast_Date DESC) = 1
+    ORDER BY date
     """
-    Symmetric Mean Absolute Percentage Error (sMAPE), in %.
-    - Handles zero denominators safely.
+    df_fred = bq_manager.run_gbq_sql(fred_sql, return_dataframe=True)
+    df_fred['date'] = pd.to_datetime(df_fred['date'])
+    
+    # Forward fill market data
+    cols_to_fill = ['UNRATE', 'HSN1F', 'FEDFUNDS', 'MORTGAGE30US']
+    df_fred[cols_to_fill] = df_fred[cols_to_fill].apply(pd.to_numeric, errors='coerce').ffill().bfill()
+
+    # --- Step 3b: Fetch Workload Drivers (Orders) ---
+    order_hist_sql = """
+    SELECT MonthOfOrder as date, client_id, TotalOrders 
+    FROM tax_clnt_svcs.view_cx_nontax_platforms_workload_drivers
     """
-    actual = np.asarray(actual, dtype=float)
-    forecast = np.asarray(forecast, dtype=float)
-
-    denom = (np.abs(actual) + np.abs(forecast)) / 2.0
-    denom[denom == 0] = 1.0  # avoid divide-by-zero
-
-    return np.mean(np.abs(actual - forecast) / denom) * 100.0
-
-
-def force_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
+    order_fx_sql = """
+    SELECT fx_date as date, client_id, fx_vol as TotalOrders 
+    FROM tax_clnt_svcs.cx_nontax_platforms_workload_drivers_fx 
+    WHERE fx_status = 'A'
     """
-    HARDENING HELPER:
-    Convert all columns in a DataFrame to numeric floats (where possible).
-    Anything non-numeric becomes NaN then filled with 0.0.
+    df_ord_hist = bq_manager.run_gbq_sql(order_hist_sql, return_dataframe=True)
+    df_ord_fx = bq_manager.run_gbq_sql(order_fx_sql, return_dataframe=True)
+    
+    df_orders = pd.concat([df_ord_hist, df_ord_fx]).drop_duplicates(subset=['date', 'client_id'], keep='last')
+    df_orders['date'] = pd.to_datetime(df_orders['date'])
+    # Safe convert to Series then fillna
+    df_orders['TotalOrders'] = pd.to_numeric(df_orders['TotalOrders'], errors='coerce').fillna(0)
 
-    This is critical when BigQuery returns Decimal / object types that later crash SciPy.
-    """
-    if df is None or df.empty:
-        return df
-    df2 = df.copy()
-    for c in df2.columns:
-        df2[c] = pd.to_numeric(df2[c], errors="coerce")
-    df2 = df2.fillna(0.0).astype(float)
-    return df2
+    # Map Parent Drivers
+    DRIVER_MAP = {
+        'FNC - CMS': 'FNC', 
+        'FNC - Ports': 'FNC', 
+        'Mercury Integrations': 'Mercury',
+        'Appraisal Scope': 'Appraisal Scope'
+    }
 
+    # --- Step 3c: Fetch Base Call Data & Normalize ---
+    df_calls = bq_manager.run_gbq_sql(SQL_QUERY_PATH, return_dataframe=True)
+    df_calls['date'] = pd.to_datetime(df_calls['date'])
+    
+    # Safe convert
+    df_calls['Total_Offered'] = pd.to_numeric(df_calls['Total_Offered'], errors='coerce').fillna(0)
+    df_calls['business_day_count'] = pd.to_numeric(df_calls['business_day_count'], errors='coerce').fillna(21)
+    
+    # TARGET: Rate per Business Day
+    df_calls['target_rate'] = np.where(
+        df_calls['business_day_count'] > 0,
+        df_calls['Total_Offered'] / df_calls['business_day_count'],
+        0
+    )
 
-def safe_pearsonr(y: pd.Series, x: pd.Series):
-    """
-    Compute pearson correlation safely, returning (r, p) or (None, None) if invalid.
+    # --- Step 3d: Master Merge ---
+    df_calls['join_key'] = df_calls['client_id'].map(DRIVER_MAP).fillna(df_calls['client_id'])
+    
+    df = pd.merge(df_calls, df_fred, on='date', how='left')
+    df = pd.merge(df, df_orders.rename(columns={'client_id': 'join_key'}), on=['date', 'join_key'], how='left')
+    
+    # Fill remaining nulls in drivers/market data
+    metric_cols = ['TotalOrders'] + cols_to_fill
+    df[metric_cols] = df.groupby('client_id')[metric_cols].ffill()
 
-    Guards:
-    - Force numeric to float
-    - Drop NaNs
-    - Require >=3 points
-    - Skip constant vectors (std == 0)
-    """
-    # Force numeric conversion (LAST LINE OF DEFENSE)
-    y_num = pd.to_numeric(y, errors="coerce")
-    x_num = pd.to_numeric(x, errors="coerce")
+    # --- Step 4: Feature Engineering ---
+    df = df.sort_values(['client_id', 'date'])
+    
+    # Create Lags
+    for l in [1, 2, 3, 6, 12]:
+        df[f'lag_{l}'] = df.groupby('client_id')['target_rate'].shift(l)
+        df[f'order_lag_{l}'] = df.groupby('client_id')['TotalOrders'].shift(l)
+        df[f'mkt_lag_{l}'] = df.groupby('client_id')['MORTGAGE30US'].shift(l)
+    
+    # Efficiency Metric
+    with np.errstate(divide='ignore', invalid='ignore'):
+        df['calls_per_order'] = df['Total_Offered'] / df['TotalOrders']
+    df['calls_per_order'] = df['calls_per_order'].fillna(0).replace([np.inf, -np.inf], 0)
 
-    tmp = pd.concat([y_num, x_num], axis=1).dropna()
-    if len(tmp) < 3:
-        return None, None
+    forecast_results = []
+    audit_log = []
+    
+    # --- Step 5: Client Modeling Loop ---
+    for cid in df['client_id'].unique():
+        c_df = df[df['client_id'] == cid].copy()
+        
+        # Skip if not enough history
+        if len(c_df.dropna(subset=['target_rate'])) < 12: 
+            logger.warning(f"Skipping {cid}: Insufficient history.")
+            continue
+            
+        meta = c_df[['bu', 'client', 'groups']].iloc[-1].to_dict()
+        
+        # Validation Split: Train on history, Test on last 6 months
+        train = c_df.dropna(subset=['target_rate', 'lag_12', 'TotalOrders']).iloc[:-6]
+        valid = c_df.iloc[-6:]
+        y_val = valid['target_rate'].values
+        
+        models_val = {}
 
-    yv = tmp.iloc[:, 0].astype(float).to_numpy()
-    xv = tmp.iloc[:, 1].astype(float).to_numpy()
+        # --- MODEL 1: Weighted Lag Blend 1 ---
+        models_val['WLB1'] = (0.6 * valid['lag_1']) + (0.2 * valid['lag_2']) + (0.2 * valid['lag_3'])
 
-    # pearson is undefined for constants
-    if np.std(yv) == 0 or np.std(xv) == 0:
-        return None, None
+        # --- MODEL 2: Weighted Lag Blend 2 ---
+        models_val['WLB2'] = (0.6 * valid['lag_1']) + (0.25 * valid['lag_3']) + (0.15 * valid['lag_6'])
 
-    r, p = pearsonr(yv, xv)
-    return float(r), float(p)
+        # --- MODEL 3: XGBoost ---
+        feats = ['lag_1', 'lag_3', 'lag_6', 'lag_12', 'TotalOrders', 'MORTGAGE30US', 'UNRATE']
+        
+        if len(train) > 5:
+            xgb_mod = XGBRegressor(n_estimators=50, learning_rate=0.05, max_depth=4, random_state=42)
+            xgb_mod.fit(train[feats].fillna(0), train['target_rate'])
+            models_val['XGB'] = xgb_mod.predict(valid[feats].fillna(0))
+        else:
+            models_val['XGB'] = models_val['WLB1']
 
+        # --- MODEL 4: Ratio Model ---
+        avg_ratio = train['calls_per_order'].replace([np.inf, -np.inf], 0).mean()
+        if pd.isna(avg_ratio): avg_ratio = 0
+        
+        valid_orders = valid['TotalOrders'].ffill()
+        models_val['RatioModel'] = (avg_ratio * valid_orders) / valid['business_day_count']
 
-# ------------------- CORE PIPELINE -------------------------
-def run_pipeline():
-    """
-    Main end-to-end pipeline:
-    1) Load call volume history (cpbd) from GBQ SQL file
-    2) Load workload driver history + future FX
-    3) For each (BU, Client, Group, VolumeType) combo:
-       - build monthly ts
-       - correlate drivers to pick best driver (optional)
-       - bake-off models using last VAL_LEN months as validation
-       - generate next FORECAST_HORIZON months forecast
-    4) Export local CSV outputs
-    """
-    try:
-        logger.info(f"Starting Credit Pipeline v5.4. Mode: {'BACKCAST' if BACKCAST_MODE else 'PROD'}")
+        # --- SELECTION: Pick Winner by SMAPE ---
+        valid_scores = {k: smape(y_val, v) for k, v in models_val.items()}
+        winner = min(valid_scores, key=valid_scores.get)
+        
+        audit_log.append({
+            'client_id': cid, 
+            'winner': winner, 
+            'smape': valid_scores[winner], 
+            'avg_ratio': avg_ratio
+        })
 
-        # ============================================================
-        # 1) LOAD CALL DATA (HISTORICAL CPBD)
-        # ============================================================
-        df_calls = bigquery_manager.run_gbq_sql(MAIN_DATA_SQL_PATH, return_dataframe=True)
-        if not isinstance(df_calls, pd.DataFrame):
-            raise ValueError("BigQueryManager failed to return a DataFrame for MAIN_DATA_SQL_PATH. Check SQL file path or GBQ auth.")
-
-        # Normalize column names to avoid casing issues
-        df_calls.columns = [c.lower().strip() for c in df_calls.columns]
-
-        # The historical SQL may name cpbd differently; normalize to "cpbd"
-        vol_cols = ['cpbd', 'volume_per_business_day', 'callsoffered_per_business_day', 'total_calls_offered']
-        found_vol_col = next((c for c in vol_cols if c in df_calls.columns), None)
-        if found_vol_col and found_vol_col != 'cpbd':
-            df_calls.rename(columns={found_vol_col: 'cpbd'}, inplace=True)
-
-        # HARD FIX: force numeric on cpbd (prevents mixed object dtype later)
-        if 'cpbd' not in df_calls.columns:
-            raise ValueError("Expected a volume column (cpbd/volume_per_business_day/etc.) but none were found in df_calls.")
-
-        df_calls['cpbd'] = pd.to_numeric(df_calls['cpbd'], errors='coerce').fillna(0.0).astype(float)
-
-        # Ensure month is datetime (month-start preferred)
-        if 'month' not in df_calls.columns:
-            raise ValueError("Expected 'month' column in df_calls but it was missing. Check MAIN_DATA_SQL_PATH output.")
-        df_calls['month'] = pd.to_datetime(df_calls['month'])
-
-        # Validate expected dimensional columns exist
-        required_dim_cols = ['bu', 'client', 'groups', 'volumetype']
-        missing_dims = [c for c in required_dim_cols if c not in df_calls.columns]
-        if missing_dims:
-            raise ValueError(f"Missing required dimension columns in call data: {missing_dims}. Check SQL output.")
-
-        # Collapsing groups into a controlled list to prevent overly granular modeling
-        valid_groups = [
-            'Main', 'General', 'Level', 'Rapid Recheck', 'Tax Transcripts', 'TS2', 'Billing', 'MtgGrp', 'Escalations'
-        ]
-        df_calls['groups_collapsed'] = df_calls['groups'].apply(
-            lambda x: x if x in valid_groups else 'Other Credit Groups'
-        )
-
-        # ============================================================
-        # 2) LOAD WORKLOAD DRIVERS (HISTORICAL + FUTURE FX)
-        # ============================================================
-        # Historical workload: month/product/orders
-        wl_sql = """
-        SELECT
-          MonthOfOrder AS month,
-          product,
-          TotalOrders
-        FROM tax_clnt_svcs.view_cx_nontax_platforms_workload_drivers
-        WHERE client_id = 'Credit'
-        """
-        wl_hist_raw = bigquery_manager.run_gbq_sql(wl_sql, return_dataframe=True)
-
-        # Create wide driver history: one row per month, one column per product
-        df_wl_wide = pd.DataFrame()
-        driver_features = []  # will hold base + lag feature names
-
-        if isinstance(wl_hist_raw, pd.DataFrame) and not wl_hist_raw.empty:
-            # Normalize + force month dtype
-            wl_hist_raw.columns = [c.lower().strip() for c in wl_hist_raw.columns]
-            wl_hist_raw['month'] = pd.to_datetime(wl_hist_raw['month'])
-
-            # Force numeric on raw metric before pivot (but BigQuery can still return Decimal later)
-            wl_hist_raw['totalorders'] = pd.to_numeric(wl_hist_raw['totalorders'], errors='coerce').fillna(0.0)
-
-            # Pivot wide; groupby sum ensures unique (month, product) index pairs
-            df_wl_wide = (
-                wl_hist_raw
-                .groupby(['month', 'product'])['totalorders']
-                .sum()
-                .unstack()
-                .fillna(0.0)
-            )
-            df_wl_wide.index = pd.to_datetime(df_wl_wide.index)
-
-            # *** CRITICAL HARD FIX ***
-            # After unstack/pivot, df can still be object dtype (Decimals/mixed).
-            # Force all driver columns to float now.
-            df_wl_wide = force_numeric_df(df_wl_wide)
-
-            # Create lag features for each product driver (L1 and L2)
-            for col in df_wl_wide.columns:
-                df_wl_wide[f"{col}_L1"] = df_wl_wide[col].shift(1)
-                df_wl_wide[f"{col}_L2"] = df_wl_wide[col].shift(2)
-                driver_features.extend([col, f"{col}_L1", f"{col}_L2"])
-
-        # Future workload drivers (forecasted volumes)
-        fut_wl_sql = """
-        SELECT
-          fx_date AS month,
-          product,
-          fx_vol
-        FROM tax_clnt_svcs.cx_nontax_platforms_workload_drivers_fx
-        WHERE client_id = 'Credit'
-          AND fx_status = 'A'
-        """
-        wl_fut_raw = bigquery_manager.run_gbq_sql(fut_wl_sql, return_dataframe=True)
-
-        df_wl_fut_wide = pd.DataFrame()
-        if isinstance(wl_fut_raw, pd.DataFrame) and not wl_fut_raw.empty:
-            wl_fut_raw.columns = [c.lower().strip() for c in wl_fut_raw.columns]
-            wl_fut_raw['month'] = pd.to_datetime(wl_fut_raw['month'])
-
-            wl_fut_raw['fx_vol'] = pd.to_numeric(wl_fut_raw['fx_vol'], errors='coerce').fillna(0.0)
-
-            df_wl_fut_wide = (
-                wl_fut_raw
-                .groupby(['month', 'product'])['fx_vol']
-                .sum()
-                .unstack()
-                .fillna(0.0)
-            )
-            df_wl_fut_wide.index = pd.to_datetime(df_wl_fut_wide.index)
-
-            # *** CRITICAL HARD FIX ***
-            df_wl_fut_wide = force_numeric_df(df_wl_fut_wide)
-
-        # ============================================================
-        # 3) BAKE-OFF ENGINE
-        # ============================================================
-        forecast_rows = []   # final forecast outputs
-        eval_logs = []       # model winner + score per combo
-        corr_logs = []       # feature correlations per combo
-
-        # Build unique modeling combos
-        combos = df_calls[['bu', 'client', 'groups_collapsed', 'volumetype']].drop_duplicates()
-
-        for _, combo in combos.iterrows():
-            bu = combo['bu']
-            client = combo['client']
-            group = combo['groups_collapsed']
-            vtype = combo['volumetype']
-
-            # Filter subset and ensure sorted monthly order
-            subset = (
-                df_calls[
-                    (df_calls['client'] == client) &
-                    (df_calls['groups_collapsed'] == group) &
-                    (df_calls['volumetype'] == vtype)
-                ]
-                .sort_values('month')
-            )
-
-            # Apply launch date rule if configured
-            start_key = LAUNCH_DATES.get((client, 'All')) or LAUNCH_DATES.get((client, str(vtype).capitalize()))
-            if start_key:
-                subset = subset[subset['month'] >= pd.to_datetime(start_key)]
-
-            # Build monthly unique time series: groupby sum guarantees unique month index
-            ts = subset.groupby('month')['cpbd'].sum().astype(float)
-
-            # Skip if too short to validate + forecast reliably
-            if len(ts) < max(6, VAL_LEN + 3):
-                continue
-
-            # If no workload drivers, we still run naïve models; workload models just won't be eligible
-            merged = pd.DataFrame({'cpbd': ts})
-
-            # Join with workload history on month (inner join ensures aligned months)
-            if not df_wl_wide.empty:
-                merged = pd.concat([merged, df_wl_wide], axis=1, join='inner')
-
-            merged = merged.dropna()
-
-            # ========================================================
-            # 3A) DRIVER SELECTION (choose best correlated driver)
-            # ========================================================
-            best_driver = None
-            max_corr = 0.0
-
-            # Only attempt driver selection if we have driver features present
-            if driver_features and len(merged) >= 5:
-                for feat in driver_features:
-                    if feat not in merged.columns:
-                        continue
-
-                    r, p = safe_pearsonr(merged['cpbd'], merged[feat])
-                    if r is None or p is None:
-                        continue
-
-                    corr_logs.append({
-                        'Client': client,
-                        'Group': group,
-                        'VolumeType': vtype,
-                        'Feature': feat,
-                        'Corr': r,
-                        'Pval': p
-                    })
-
-                    # Keep strongest statistically significant correlation
-                    if p < 0.05 and abs(r) > max_corr:
-                        max_corr = abs(r)
-                        best_driver = feat
-
-            # ========================================================
-            # 3B) TRAIN/VAL SPLIT
-            # ========================================================
-            train_ts = ts.iloc[:-VAL_LEN]
-            val_actuals = ts.iloc[-VAL_LEN:]
-
-            # Container for model predictions over historical index
-            # (we will compute sMAPE on the last VAL_LEN months)
-            m_preds = {}
-
-            # ========================================================
-            # MODEL 1: WLB Fixed (simple weighted lag blend)
-            # - Uses lag-1, lag-3, lag-12 with fixed weights.
-            # ========================================================
-            l1 = train_ts.shift(1)
-            l3 = train_ts.shift(3)
-            l12 = train_ts.shift(12)
-
-            # If lag12 is missing early, fallback to lag1
-            wlb_series = (l1 * 0.6) + (l3 * 0.2) + (l12.fillna(l1) * 0.2)
-            m_preds['WLB_Fixed'] = wlb_series
-
-            # ========================================================
-            # MODEL 2: SeasonalNaiveGR
-            # - Uses last year's month (lag-12) scaled by recent growth rate.
-            # - Growth rate uses (t / t-3) on training tail, guarded for division by zero.
-            # ========================================================
-            if len(train_ts) > 4 and train_ts.iloc[-4] != 0:
-                gr = float(train_ts.iloc[-1] / train_ts.iloc[-4])
+        # --- Step 6: Recursive Forecasting (Back-cast + Future) ---
+        full_range = pd.date_range(start=BACKCAST_START, periods=HORIZON + 12, freq='MS')
+        
+        driver_key = DRIVER_MAP.get(cid, cid)
+        future_orders_lookup = df_orders[df_orders['client_id'] == driver_key].set_index('date')['TotalOrders'].to_dict()
+        
+        for d in full_range:
+            d_ts = pd.Timestamp(d)
+            
+            # 1. Get Business Days
+            biz_days = df_calls.loc[df_calls['date'] == d_ts, 'business_day_count']
+            if not biz_days.empty:
+                biz_days = biz_days.values[0]
             else:
-                gr = 1.0
+                biz_days = np.busday_count(d_ts.date(), (d_ts + pd.offsets.MonthEnd(0)).date())
+            
+            # 2. Get Forecasted Driver (Orders)
+            future_order_vol = future_orders_lookup.get(d_ts, 0)
+            if future_order_vol == 0:
+                future_order_vol = c_df['TotalOrders'].iloc[-1] 
 
-            snaive_gr = train_ts.shift(12) * gr
-            m_preds['SeasonalNaiveGR'] = snaive_gr
+            # 3. Calculate Prediction based on Winner
+            pred_rate = 0.0
+            
+            if winner == 'RatioModel':
+                pred_rate = (avg_ratio * future_order_vol) / biz_days
+            elif winner == 'XGB':
+                pred_rate = models_val['XGB'].mean()
+            else:
+                pred_rate = models_val[winner].mean()
 
-            # ========================================================
-            # MODEL 3: Native3m
-            # - 3-month rolling mean shifted by 1 month
-            # ========================================================
-            native3m = train_ts.rolling(3).mean().shift(1)
-            m_preds['Native3m'] = native3m
+            # 4. De-normalize to Total Volume
+            final_vol = int(pred_rate * biz_days)
 
-            # ========================================================
-            # MODEL 4/5: Workload models (Ratio and MLR)
-            # - Only eligible if we found a strong driver.
-            # - We require a strong absolute correlation threshold (ex: > 0.6)
-            # ========================================================
-            ratio_val = None
-            reg = None
-
-            if best_driver and max_corr > 0.6 and best_driver in merged.columns:
-                # Align training months to merged frame
-                m_train = merged.loc[train_ts.index].copy()
-
-                # Ensure driver column is numeric float
-                m_train['cpbd'] = pd.to_numeric(m_train['cpbd'], errors='coerce')
-                m_train[best_driver] = pd.to_numeric(m_train[best_driver], errors='coerce')
-
-                # ---- Workload Ratio ----
-                # ratio = cpbd / driver; use last 6 valid months average
-                denom = m_train[best_driver].replace(0, np.nan)
-                ratio_series = (m_train['cpbd'] / denom).replace([np.inf, -np.inf], np.nan).dropna()
-
-                if len(ratio_series) >= 3:
-                    ratio_val = float(ratio_series.tail(6).mean())
-                    m_preds['Workload_Ratio'] = merged[best_driver].astype(float) * ratio_val
-
-                # ---- MLR (single-feature linear regression) ----
-                # Fit: cpbd ~ driver
-                # Only fit if we have enough non-null records
-                fit_df = m_train[['cpbd', best_driver]].dropna()
-                if len(fit_df) >= 4:
-                    X = fit_df[[best_driver]].astype(float).values
-                    y = fit_df['cpbd'].astype(float).values
-                    reg = LinearRegression().fit(X, y)
-                    m_preds['MLR'] = pd.Series(
-                        reg.predict(merged[[best_driver]].astype(float).values),
-                        index=merged.index
-                    )
-
-            # ========================================================
-            # 3C) PICK WINNER BY sMAPE ON VALIDATION WINDOW
-            # ========================================================
-            scores = {}
-            for model_name, preds in m_preds.items():
-                # Compare only validation months; fill missing with 0 to keep scoring stable
-                aligned = preds.reindex(val_actuals.index).fillna(0.0)
-                scores[model_name] = smape(val_actuals.values, aligned.values)
-
-            # Winner = lowest sMAPE
-            winner = min(scores, key=scores.get)
-
-            eval_logs.append({
-                'Client': client,
-                'Group': group,
-                'VolumeType': vtype,
-                'Winner': winner,
-                'sMAPE': scores[winner],
-                'Best_Driver': best_driver if best_driver else "None",
-                'AbsCorr': max_corr
+            forecast_results.append({
+                'fx_date': d.date(),
+                'bu': meta['bu'],
+                'client': meta['client'],
+                'client_id': cid,
+                'groups': meta['groups'],
+                'vol_type': 'phone',
+                'fx_vol': final_vol,
+                'fx_id': f"{winner}_v245",
+                'fx_status': 'A',
+                'load_ts': STAMP
             })
 
-            # ========================================================
-            # 4) FORECAST GENERATION (next FORECAST_HORIZON months)
-            # ========================================================
-            # Build future month sequence starting next month after last historical month
-            future_dates = pd.date_range(ts.index.max() + pd.DateOffset(months=1),
-                                        periods=FORECAST_HORIZON, freq='MS')
+    # --- Step 7: Export Outputs ---
+    if forecast_results:
+        pd.DataFrame(forecast_results).to_csv(LOCAL_CSV, index=False)
+        pd.DataFrame(audit_log).to_csv(AUDIT_CSV, index=False)
+        df.to_csv(MODELING_DATA_CSV, index=False)
+        
+        with open(SUMMARIES_FILE, 'w') as f:
+            f.write(f"Forecast Run: {STAMP}\n" + "="*40 + "\n")
+            for entry in audit_log:
+                f.write(f"Client: {entry['client_id']:<20} | Winner: {entry['winner']:<10} | SMAPE: {entry['smape']:.2f}%\n")
 
-            # Precompute fallback mean (for naïve non-workload forecast fallback)
-            fallback_mean = float(ts.tail(3).mean())
+        logger.info(f"✓ Pipeline Complete. All files saved to C:\\WFM_Scripting\\")
+    else:
+        logger.warning("No forecasts were generated.")
 
-            for d in future_dates:
-                # Workload-based forecast uses future workload where possible
-                if winner in ['Workload_Ratio', 'MLR'] and best_driver:
-                    # Parse lag from feature name (e.g., "Zillow_L2" => base "Zillow" lag 2)
-                    if "_L" in best_driver:
-                        base_p = best_driver.split("_L")[0]
-                        lag_v = int(best_driver.split("_L")[1])
-                    else:
-                        base_p = best_driver
-                        lag_v = 0
-
-                    # If best driver is lagged, the workload month needed is shifted back
-                    tgt_d = d - pd.DateOffset(months=lag_v)
-
-                    # Pull future workload if available; otherwise fallback to historical mean
-                    if (not df_wl_fut_wide.empty) and (tgt_d in df_wl_fut_wide.index) and (base_p in df_wl_fut_wide.columns):
-                        wl_val = float(df_wl_fut_wide.loc[tgt_d, base_p])
-                    else:
-                        # If we don't have future driver value, fallback to historical driver mean if present
-                        wl_val = float(df_wl_wide[base_p].mean()) if (not df_wl_wide.empty and base_p in df_wl_wide.columns) else 0.0
-
-                    # Compute prediction using ratio or regression
-                    if winner == 'Workload_Ratio' and ratio_val is not None:
-                        pred_v = wl_val * ratio_val
-                    elif winner == 'MLR' and reg is not None:
-                        pred_v = float(reg.predict(np.array([[wl_val]], dtype=float))[0])
-                    else:
-                        # If something wasn't fit properly, fallback
-                        pred_v = fallback_mean
-                else:
-                    # For all other winners, use a simple stable fallback (mean of last 3 months)
-                    # NOTE: your original code did this; keeping consistent.
-                    pred_v = fallback_mean
-
-                forecast_rows.append({
-                    'Month': d,
-                    'bu': bu,
-                    'Client': client,
-                    'Groups': group,
-                    'VolumeType': vtype,
-                    'Forecast_CPBD': round(max(0.0, float(pred_v)), 2),
-                    'Model_ID': MODEL_IDS.get(winner, winner),
-                    'Best_Driver': best_driver if best_driver else "None"
-                })
-
-        # ============================================================
-        # 5) EXPORT LOCAL FILES
-        # ============================================================
-        # Forecast output
-        pd.DataFrame(forecast_rows).to_csv(LOCAL_CSV, index=False)
-
-        # Model evaluation summary
-        pd.DataFrame(eval_logs).to_csv(AUDIT_CSV, index=False)
-
-        # Correlation log output (driver screening)
-        pd.DataFrame(corr_logs).to_csv(CORRELATION_CSV, index=False)
-
-        # Save full call data used for modeling (raw-ish, after normalization)
-        df_calls.to_csv(MODELING_DATA_CSV, index=False)
-
-        # Save model ID reference (this file name kept for your existing workflow)
-        pd.DataFrame([{'Model': k, 'ID': v} for k, v in MODEL_IDS.items()]).to_csv(STATS_CSV, index=False)
-
-        logger.info(f"Pipeline Finished Successfully. Output files written under: {BASE_DIR}")
-
-    except Exception as e:
-        # Log the root failure
-        logger.error(f"Critical Failure: {e}")
-
-        # scripthelper EmailManager.handle_error raises the exception after sending notifications.
-        # is_test=True prevents blasting prod DLs (per your standard usage).
-        email_manager.handle_error("Credit Forecast Script Failure", e, is_test=True)
+except Exception as e:
+    email_manager.handle_error("V2.4.5 Failure", e, is_test=True)
 
 
-if __name__ == "__main__":
-    run_pipeline()
+PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/Activate.ps1
+(venv_Master) PS C:\WFM_Scripting\Forecasting> & C:/Scripting/Python_envs/venv_Master/Scripts/python.exe c:/WFM_Scripting/Forecasting/Rpt_283_File.py
+Traceback (most recent call last):
+  File "c:\WFM_Scripting\Forecasting\Rpt_283_File.py", line 280, in <module>
+    email_manager.handle_error("V2.4.5 Failure", e, is_test=True)
+  File "C:\WFM_Scripting\Automation\scripthelper.py", line 1752, in handle_error
+    raise exception
+  File "c:\WFM_Scripting\Forecasting\Rpt_283_File.py", line 207, in <module>
+    valid_scores = {k: smape(y_val, v) for k, v in models_val.items()}
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "c:\WFM_Scripting\Forecasting\Rpt_283_File.py", line 207, in <dictcomp>
+    valid_scores = {k: smape(y_val, v) for k, v in models_val.items()}
+                       ^^^^^^^^^^^^^^^
+  File "c:\WFM_Scripting\Forecasting\Rpt_283_File.py", line 69, in smape
+    f = np.nan_to_num(np.array(f, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\pandas\core\series.py", line 953, in __array__
+    arr = np.asarray(values, dtype=dtype)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\pandas\core\arrays\masked.py", line 575, in __array__
+    return self.to_numpy(dtype=dtype)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Scripting\Python_envs\venv_Master\Lib\site-packages\pandas\core\arrays\masked.py", line 487, in to_numpy
+    raise ValueError(
+ValueError: cannot convert to 'float64'-dtype NumPy array with missing values. Specify an appropriate 'na_value' for this dtype.
