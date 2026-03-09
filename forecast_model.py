@@ -3,320 +3,499 @@ import math
 import pandas as pd
 import numpy as np
 
-# Import your custom framework
 from scripthelper import Config, Logger, BigQueryManager
 
-def erlang_c_probability(A, N):
-    """Calculates the probability a call waits in queue (Erlang C formula)."""
-    if N <= A: return 1.0
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Origins where Erlang C applies (real-time queue, agents must be seated).
+# Any origin NOT in this set falls back to the linear workload method.
+ERLANG_ORIGINS = {'phone', 'chat'}
+
+# Weeks per month (standard WFM constant)
+WEEKS_IN_MONTH = 4.333
+
+# Default SLA parameters used when interval data has no values
+DEFAULT_SL_TARGET    = 0.80
+DEFAULT_SL_THRESHOLD = 30       # seconds
+DEFAULT_AHT          = 300      # seconds
+
+# SQL paths
+INTERVAL_SQL_PATH = r"C:\WFM_Scripting\Automation\GBQ - cx_interval_30mins_vols.sql"
+FTE_SQL_PATH      = r"C:\WFM_Scripting\Automation\GBQ - cx_fte_calculator.sql"
+
+
+# =============================================================================
+# MATH HELPERS
+# =============================================================================
+
+def erlang_c_probability(A: float, N: int) -> float:
+    """
+    Calculates P(wait) — the probability a contact waits in queue — using
+    the Erlang C formula.  Returns 1.0 (worst case) if N <= A (server
+    utilisation >= 100 %).
+    """
+    if N <= A:
+        return 1.0
     inv_B = 1.0
     for i in range(1, int(N) + 1):
         inv_B = 1.0 + inv_B * (i / A)
     B = 1.0 / inv_B
-    C = (N * B) / (N - A * (1 - B))
+    C = (N * B) / (N - A * (1.0 - B))
     return C
 
-def required_agents(volume, aht, target_sl=0.80, target_time=30, interval_secs=1800):
-    """Iterates through agent counts to find the minimum required to hit the Target SL."""
-    if pd.isna(volume) or volume <= 0: return 0
-    if pd.isna(aht) or aht <= 0: aht = 300 
-    
+
+def required_agents(
+    volume: float,
+    aht: float,
+    target_sl: float = DEFAULT_SL_TARGET,
+    target_time: float = DEFAULT_SL_THRESHOLD,
+    interval_secs: int = 1800,
+) -> int:
+    """
+    Iterates agent counts upward from the traffic intensity floor until the
+    Erlang C service level meets or exceeds target_sl within target_time
+    seconds.  Returns 0 for null / zero inputs.
+    """
+    if pd.isna(volume) or volume <= 0:
+        return 0
+    if pd.isna(aht) or aht <= 0:
+        aht = DEFAULT_AHT
+
     A = (volume * aht) / interval_secs
     N = math.ceil(A)
-    
-    while N < A + 150:
-        C = erlang_c_probability(A, N)
+
+    for _ in range(300):                        # hard cap prevents infinite loop
+        C  = erlang_c_probability(A, N)
         sl = 1.0 - C * math.exp(-(N - A) * (target_time / aht))
         if sl >= target_sl:
             return N
         N += 1
-    return N
 
-def calc_final_fte(base_fte, pct, occ, shrink, attr):
-    """Applies shrinkage, occupancy, and attrition to calculate final payroll FTE."""
-    if pd.isna(pct) or pct <= 0 or pd.isna(occ) or occ <= 0: 
+    return N                                    # return best-effort if cap hit
+
+
+def calc_final_fte(
+    base_fte: float,
+    pct: float,
+    occ: float,
+    shrink: float,
+    attr: float,
+) -> float:
+    """
+    Converts a raw base FTE (scheduled seats) to payroll FTE by applying
+    vendor split, occupancy cap, shrinkage, and attrition.
+    Returns 0.0 for invalid/zero pct or occupancy inputs.
+    """
+    if pd.isna(pct) or pct <= 0 or pd.isna(occ) or occ <= 0:
         return 0.0
-    return (base_fte * pct) / (occ * (1 - shrink)) * (1 + attr)
+    return (base_fte * pct) / (occ * (1.0 - shrink)) * (1.0 + attr)
+
+
+def linear_base_fte(
+    volume: float,
+    aht: float,
+    monthly_work_hours: float,
+) -> float:
+    """
+    Flat linear workload method: (Volume × AHT) / 3600 / Monthly Work Hours.
+    Used as a fallback for async origins (email) where Erlang C is not valid.
+    """
+    if pd.isna(volume) or volume <= 0 or monthly_work_hours <= 0:
+        return 0.0
+    return (volume * aht) / 3600.0 / monthly_work_hours
+
+
+# =============================================================================
+# INTERVAL PROFILE BUILDER
+# =============================================================================
+
+def build_arrival_profiles(df_intervals: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregates raw 30-minute interval data into a normalised arrival profile
+    keyed on (bu, origin, dow, time).
+
+    Each row carries:
+      - bucket_vol       : mean offered volume for that slot
+      - Avg_AHT          : volume-weighted mean AHT
+      - SL_Threshold_Seconds / Target_SLA : mean SLA params
+      - Interval_Weight  : fraction of the origin's weekly volume that lands
+                           in this specific (dow, time) bucket — used to
+                           distribute a monthly forecast across the week.
+    """
+    df = df_intervals.copy()
+
+    # Normalise origin casing
+    df['origin'] = df['origin'].str.lower().str.strip()
+
+    # Parse timestamps
+    df['interval_start'] = pd.to_datetime(df['interval_start'])
+    df['dow']  = df['interval_start'].dt.dayofweek      # 0=Mon … 6=Sun
+    df['time'] = df['interval_start'].dt.time
+
+    # Numeric coercion (Avg_AHT / Service_Level come through as object)
+    for col in ['Offered_Volume', 'Avg_AHT', 'SL_Threshold_Seconds']:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    # Derived workload column for weighted-AHT calculation
+    df['workload'] = df['Offered_Volume'] * df['Avg_AHT']
+
+    # Aggregate: mean across the historical window so the profile represents
+    # a "typical" week rather than the sum of all history.
+    profile = (
+        df.groupby(['bu', 'origin', 'dow', 'time'])
+        .agg(
+            bucket_vol            = ('Offered_Volume',       'mean'),
+            bucket_workload       = ('workload',             'mean'),
+            SL_Threshold_Seconds  = ('SL_Threshold_Seconds', 'mean'),
+        )
+        .reset_index()
+    )
+
+    # Defensive defaults
+    profile['SL_Threshold_Seconds'] = profile['SL_Threshold_Seconds'].where(
+        profile['SL_Threshold_Seconds'] > 0, DEFAULT_SL_THRESHOLD
+    )
+
+    # Volume-weighted AHT per bucket
+    profile['Avg_AHT'] = np.where(
+        profile['bucket_vol'] > 0,
+        profile['bucket_workload'] / profile['bucket_vol'],
+        DEFAULT_AHT,
+    )
+
+    # Fixed SLA target (all Answerlink contracts = 80 / 30s currently)
+    # If your BQ query ever exposes a per-client Target_SLA, join it here.
+    profile['Target_SLA'] = DEFAULT_SL_TARGET
+
+    # Interval weight = this bucket's share of the origin's total weekly volume
+    origin_totals = (
+        profile.groupby(['bu', 'origin'])['bucket_vol']
+        .sum()
+        .reset_index()
+        .rename(columns={'bucket_vol': 'origin_total_vol'})
+    )
+    profile = profile.merge(origin_totals, on=['bu', 'origin'])
+    profile['Interval_Weight'] = np.where(
+        profile['origin_total_vol'] > 0,
+        profile['bucket_vol'] / profile['origin_total_vol'],
+        0.0,
+    )
+
+    return profile
+
+
+# =============================================================================
+# ERLANG ENGINE  (pooled, then apportioned)
+# =============================================================================
+
+def run_erlang_pool(
+    df_fte: pd.DataFrame,
+    profile_df: pd.DataFrame,
+    logger,
+) -> pd.DataFrame:
+    """
+    Core computation loop.
+
+    Groups the FTE forecast by (date, bu, origin) to form the agent pool,
+    runs Erlang C on the pooled volume using the arrival profile, then
+    apportions the resulting base FTE back to each client row by workload
+    share.
+
+    For origins outside ERLANG_ORIGINS the linear method is used instead.
+
+    Returns df_fte with six appended columns:
+        Domestic_Actual_Erlang_FTE
+        Telus_Actual_Erlang_FTE
+        Total_Actual_Erlang_FTE
+        Domestic_Forecast_Erlang_FTE
+        Telus_Forecast_Erlang_FTE
+        Total_Forecast_Erlang_FTE
+    """
+
+    # Pre-compute workload columns for both actual and forecast volumes.
+    #
+    # AHT resolution priority:
+    #   1. Actual_AHT  — available for historical months with real call data
+    #   2. domestic_fixed_aht — populated for all rows including future forecast
+    #      months where Actual_AHT is 0 (no actuals exist yet)
+    #
+    # This ensures forecast_workload is never zero for future periods, which
+    # would cause workload-share apportionment to produce NaN/0 results.
+    df_fte = df_fte.copy()
+    df_fte['origin_norm'] = df_fte['origin'].str.lower().str.strip()
+
+    df_fte['resolved_aht'] = np.where(
+        df_fte['Actual_AHT'] > 0,
+        df_fte['Actual_AHT'],
+        df_fte['domestic_fixed_aht'],
+    )
+
+    df_fte['actual_workload']   = df_fte['Actual_Volume']       * df_fte['resolved_aht']
+    df_fte['forecast_workload'] = df_fte['Net_Forecast_Volume'] * df_fte['resolved_aht']
+
+    results: dict = {}     # index → result dict
+
+    pool_keys = ['date', 'bu', 'origin_norm']
+
+    total_pools = df_fte.groupby(pool_keys).ngroups
+    pool_counter = 0
+
+    for (date_val, bu_val, origin_val), group in df_fte.groupby(pool_keys):
+
+        pool_counter += 1
+        logger.info(
+            f"  [{pool_counter}/{total_pools}] Pool: bu={bu_val} | "
+            f"origin={origin_val} | date={date_val} | rows={len(group)}"
+        )
+
+        # ── Monthly work hours ────────────────────────────────────────────
+        b_days  = group['business_day_count'].max()
+        b_hours = group['business_hours'].max()
+        monthly_work_hours = (b_days * b_hours) if (b_days * b_hours) > 0 else 157.5
+
+        # ── Pool totals ───────────────────────────────────────────────────
+        total_actual_vol    = group['Actual_Volume'].sum()
+        total_forecast_vol  = group['Net_Forecast_Volume'].sum()
+        total_actual_wl     = group['actual_workload'].sum()
+        total_forecast_wl   = group['forecast_workload'].sum()
+
+        # ── Dispatch by method ────────────────────────────────────────────
+        use_erlang = origin_val in ERLANG_ORIGINS
+
+        if use_erlang:
+            origin_profile = profile_df[
+                (profile_df['bu']     == bu_val) &
+                (profile_df['origin'] == origin_val)
+            ]
+
+            if origin_profile.empty:
+                logger.warning(
+                    f"    No interval profile found for bu={bu_val}, "
+                    f"origin={origin_val}. Falling back to linear method."
+                )
+                use_erlang = False
+
+        # ──────────────────────────────────────────────────────────────────
+        # PATH A: Erlang C (phone / chat)
+        # ──────────────────────────────────────────────────────────────────
+        if use_erlang:
+            actual_base_fte   = _erlang_base_fte(
+                total_actual_vol, origin_profile, monthly_work_hours
+            )
+            forecast_base_fte = _erlang_base_fte(
+                total_forecast_vol, origin_profile, monthly_work_hours
+            )
+        # ──────────────────────────────────────────────────────────────────
+        # PATH B: Linear fallback (email / unknown)
+        # ──────────────────────────────────────────────────────────────────
+        else:
+            # For async work (email) there is no queue concept so we use the
+            # pool's aggregate linear FTE, then apportion by workload share.
+            pool_aht = (
+                (group['actual_workload'].sum()   / total_actual_vol)
+                if total_actual_vol > 0 else DEFAULT_AHT
+            )
+            forecast_aht = (
+                (group['forecast_workload'].sum() / total_forecast_vol)
+                if total_forecast_vol > 0 else DEFAULT_AHT
+            )
+            actual_base_fte   = linear_base_fte(total_actual_vol,   pool_aht,     monthly_work_hours)
+            forecast_base_fte = linear_base_fte(total_forecast_vol, forecast_aht, monthly_work_hours)
+
+        # ──────────────────────────────────────────────────────────────────
+        # Apportion base FTE to each client row by workload share, then
+        # apply per-row shrinkage / occupancy / attrition.
+        # ──────────────────────────────────────────────────────────────────
+        for idx, row in group.iterrows():
+
+            actual_share   = row['actual_workload']   / total_actual_wl   if total_actual_wl   > 0 else 0.0
+            forecast_share = row['forecast_workload'] / total_forecast_wl if total_forecast_wl > 0 else 0.0
+
+            client_actual_base   = actual_base_fte   * actual_share
+            client_forecast_base = forecast_base_fte * forecast_share
+
+            dom_actual   = calc_final_fte(client_actual_base,   row['Domestic_Pct'], row['domestic_occupancy'], row['domestic_shrinkage'], row['domestic_attrition'])
+            tel_actual   = calc_final_fte(client_actual_base,   row['Telus_Pct'],    row['telus_occupancy'],    row['telus_shrinkage'],    row['telus_attrition'])
+            dom_forecast = calc_final_fte(client_forecast_base, row['Domestic_Pct'], row['domestic_occupancy'], row['domestic_shrinkage'], row['domestic_attrition'])
+            tel_forecast = calc_final_fte(client_forecast_base, row['Telus_Pct'],    row['telus_occupancy'],    row['telus_shrinkage'],    row['telus_attrition'])
+
+            results[idx] = {
+                'Domestic_Actual_Erlang_FTE':   round(dom_actual,   2),
+                'Telus_Actual_Erlang_FTE':       round(tel_actual,   2),
+                'Total_Actual_Erlang_FTE':       round(dom_actual   + tel_actual,   2),
+                'Domestic_Forecast_Erlang_FTE':  round(dom_forecast, 2),
+                'Telus_Forecast_Erlang_FTE':     round(tel_forecast, 2),
+                'Total_Forecast_Erlang_FTE':     round(dom_forecast + tel_forecast, 2),
+            }
+
+    # Reconstruct in original index order and concat
+    result_rows = [
+        results.get(i, {
+            'Domestic_Actual_Erlang_FTE':  0.0,
+            'Telus_Actual_Erlang_FTE':     0.0,
+            'Total_Actual_Erlang_FTE':     0.0,
+            'Domestic_Forecast_Erlang_FTE':0.0,
+            'Telus_Forecast_Erlang_FTE':   0.0,
+            'Total_Forecast_Erlang_FTE':   0.0,
+        })
+        for i in df_fte.index
+    ]
+    df_results = pd.DataFrame(result_rows)
+
+    # Drop the helper columns before returning
+    df_fte.drop(columns=['origin_norm', 'resolved_aht', 'actual_workload', 'forecast_workload'], inplace=True)
+
+    return pd.concat([df_fte.reset_index(drop=True), df_results], axis=1)
+
+
+def _erlang_base_fte(
+    total_pool_vol: float,
+    origin_profile: pd.DataFrame,
+    monthly_work_hours: float,
+) -> float:
+    """
+    Simulates one month of Erlang C across all 336 weekly half-hour slots
+    for a given pooled volume, then converts total agent-hours to base FTE.
+
+    Args:
+        total_pool_vol:    Total monthly contact volume for the entire pool.
+        origin_profile:    Filtered profile DataFrame for this (bu, origin).
+        monthly_work_hours: Business days × business hours for the month.
+
+    Returns:
+        Base FTE (scheduled seats, before shrinkage / occupancy).
+    """
+    if total_pool_vol <= 0 or origin_profile.empty:
+        return 0.0
+
+    weekly_vol = total_pool_vol / WEEKS_IN_MONTH
+    weekly_agent_hours = 0.0
+
+    for _, p_row in origin_profile.iterrows():
+        sim_vol = weekly_vol * p_row['Interval_Weight']
+        if sim_vol < 0.01:
+            continue
+        agents = required_agents(
+            volume      = sim_vol,
+            aht         = p_row['Avg_AHT'],
+            target_sl   = p_row['Target_SLA'],
+            target_time = p_row['SL_Threshold_Seconds'],
+        )
+        weekly_agent_hours += agents * 0.5      # each slot = 0.5 hrs
+
+    monthly_agent_hours = weekly_agent_hours * WEEKS_IN_MONTH
+    return monthly_agent_hours / monthly_work_hours if monthly_work_hours > 0 else 0.0
+
+
+# =============================================================================
+# DATA PREPARATION
+# =============================================================================
+
+def prep_fte_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Coerces all numeric FTE-math columns to float and fills NaN → 0.
+    Parses the date column to datetime.  Safe for mixed BigQuery date types.
+    """
+    numeric_cols = [
+        'Actual_Volume', 'Net_Forecast_Volume', 'Actual_AHT',
+        'domestic_fixed_aht', 'telus_fixed_aht',
+        'business_day_count', 'business_hours',
+        'Domestic_Pct', 'Telus_Pct',
+        'domestic_occupancy', 'domestic_shrinkage', 'domestic_attrition',
+        'telus_occupancy',    'telus_shrinkage',    'telus_attrition',
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    df['date'] = pd.to_datetime(df['date'])
+    return df
+
+
+def prep_interval_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Coerces numeric columns and normalises origin casing in the interval frame.
+    """
+    for col in ['Offered_Volume', 'Avg_AHT', 'SL_Threshold_Seconds']:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    df['origin'] = df['origin'].str.lower().str.strip()
+    df['interval_start'] = pd.to_datetime(df['interval_start'])
+    return df
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
     config = Config()
     logger = Logger()
-    bq = BigQueryManager(config) 
-    
-    logger.info("Starting Pooled Answerlink Erlang FTE generation...")
+    bq     = BigQueryManager(config)
 
-    interval_sql_path = r"C:\WFM_Scripting\Automation\GBQ - cx_interval_30mins_vols.sql"
-    fte_sql_path = r"C:\WFM_Scripting\Automation\GBQ - cx_fte_calculator.sql"
-    
-    with open(interval_sql_path, 'r') as f:
+    logger.info("=" * 70)
+    logger.info("Starting Generalised Erlang C FTE Pipeline")
+    logger.info("=" * 70)
+
+    # ── 1. Load data ──────────────────────────────────────────────────────
+    logger.info("Loading SQL files...")
+    with open(INTERVAL_SQL_PATH, 'r') as f:
         interval_sql = f.read()
-        
-    with open(fte_sql_path, 'r') as f:
+    with open(FTE_SQL_PATH, 'r') as f:
         fte_sql = f.read()
 
-    logger.info("Executing Queries...")
-    df_intervals = bq.fetch_data_bigquery(interval_sql)
-    df_fte_all = bq.fetch_data_bigquery(fte_sql)
-    
-    df_fte = df_fte_all[df_fte_all['bu'] == 'Answerlink'].copy()
-    df_intervals = df_intervals[df_intervals['bu'] == 'Answerlink'].copy()
+    logger.info("Executing BigQuery queries...")
+    df_intervals_raw = bq.fetch_data_bigquery(interval_sql)
+    df_fte_raw       = bq.fetch_data_bigquery(fte_sql)
 
-    # Clean Interval Data
-    for col in ['Offered_Volume', 'Avg_AHT', 'SL_Threshold_Seconds', 'Target_SLA']:
-        df_intervals[col] = pd.to_numeric(df_intervals[col], errors='coerce').fillna(0)
-    
-    df_intervals.loc[df_intervals['SL_Threshold_Seconds'] <= 0, 'SL_Threshold_Seconds'] = 30
-    df_intervals.loc[df_intervals['Target_SLA'] <= 0, 'Target_SLA'] = 0.80
-    
-    # -------------------------------------------------------------------------
-    # ERROR FIX: Only apply fillna(0) to specific numeric columns
-    # This prevents Pandas from trying to inject 0s into BigQuery Date objects
-    # -------------------------------------------------------------------------
-    fte_math_cols = [
-        'Net_Forecast_Volume', 'Actual_AHT', 'business_day_count', 'business_hours',
-        'Domestic_Pct', 'Telus_Pct', 'domestic_occupancy', 'domestic_shrinkage', 
-        'domestic_attrition', 'telus_occupancy', 'telus_shrinkage', 'telus_attrition'
-    ]
-    for col in fte_math_cols:
-        if col in df_fte.columns:
-            df_fte[col] = pd.to_numeric(df_fte[col], errors='coerce').fillna(0)
+    logger.info(f"  Interval rows loaded : {len(df_intervals_raw):,}")
+    logger.info(f"  FTE rows loaded      : {len(df_fte_raw):,}")
 
-    
-    # Format time columns
-    df_intervals['interval_start'] = pd.to_datetime(df_intervals['interval_start'])
-    df_intervals['dow'] = df_intervals['interval_start'].dt.dayofweek
-    df_intervals['time'] = df_intervals['interval_start'].dt.time
-    
-    # =====================================================================
-    # STEP 1: BUILD THE POOLED ARRIVAL PROFILE (Grouped by Origin)
-    # =====================================================================
-    logger.info("Building Pooled Arrival Profiles...")
-    df_intervals['workload'] = df_intervals['Offered_Volume'] * df_intervals['Avg_AHT']
-    
-    # Aggregate all clients together by Origin/Dow/Time
-    profile_df = df_intervals.groupby(['origin', 'dow', 'time']).agg(
-        bucket_vol=('Offered_Volume', 'sum'),
-        bucket_workload=('workload', 'sum'),
-        SL_Threshold_Seconds=('SL_Threshold_Seconds', 'mean'),
-        Target_SLA=('Target_SLA', 'mean')
-    ).reset_index()
-    
-    # Calculate Weighted AHT for the pooled bucket
-    profile_df['Avg_AHT'] = np.where(profile_df['bucket_vol'] > 0, profile_df['bucket_workload'] / profile_df['bucket_vol'], 300)
-    
-    # Calculate the percentage of volume each bucket represents for the whole origin
-    total_vol_df = profile_df.groupby('origin')['bucket_vol'].sum().reset_index()
-    total_vol_df.rename(columns={'bucket_vol': 'origin_total_vol'}, inplace=True)
-    profile_df = pd.merge(profile_df, total_vol_df, on='origin')
-    
-    profile_df['Interval_Weight'] = np.where(
-        profile_df['origin_total_vol'] > 0, 
-        profile_df['bucket_vol'] / profile_df['origin_total_vol'], 
-        0
+    # ── 2. Prep ───────────────────────────────────────────────────────────
+    logger.info("Preparing dataframes...")
+    df_fte       = prep_fte_dataframe(df_fte_raw.copy())
+    df_intervals = prep_interval_dataframe(df_intervals_raw.copy())
+
+    # Log coverage summary
+    for bu in df_fte['bu'].unique():
+        sub = df_fte[df_fte['bu'] == bu]
+        logger.info(
+            f"  FTE  | bu={bu:<30} | "
+            f"rows={len(sub):>4} | "
+            f"origins={sorted(sub['origin'].str.lower().unique().tolist())}"
+        )
+    for bu in df_intervals['bu'].unique():
+        sub = df_intervals[df_intervals['bu'] == bu]
+        logger.info(
+            f"  IVLS | bu={bu:<30} | "
+            f"rows={len(sub):>6} | "
+            f"origins={sorted(sub['origin'].unique().tolist())}"
+        )
+
+    # ── 3. Build arrival profiles ─────────────────────────────────────────
+    logger.info("Building pooled arrival profiles...")
+    profile_df = build_arrival_profiles(df_intervals)
+    logger.info(
+        f"  Profile rows: {len(profile_df):,} "
+        f"across {profile_df[['bu','origin']].drop_duplicates().shape[0]} bu/origin pools"
     )
 
-    # =====================================================================
-    # STEP 2: RUN ERLANG ON THE POOL, THEN APPORTION TO CLIENTS
-    # =====================================================================
-    logger.info("Simulating Pooled Volume and Apportioning FTE...")
-    
-    WEEKS_IN_MONTH = 4.333
-    df_fte['row_workload'] = df_fte['Net_Forecast_Volume'] * df_fte['Actual_AHT']
-    
-    erlang_results_dict = {}
-    
-    # Group the forecast by Month and Origin (The Agent Pool)
-    for (month_date, origin), group in df_fte.groupby(['date', 'origin']):
-        
-        total_forecast_vol = group['Net_Forecast_Volume'].sum()
-        total_group_workload = group['row_workload'].sum()
-        
-        # Get max business days/hours for this month
-        b_days = group['business_day_count'].max()
-        b_hours = group['business_hours'].max()
-        monthly_work_hours = (b_days * b_hours) if (b_days * b_hours) > 0 else 157.5
-        
-        # If no volume forecasted for the whole pool, set everyone to 0
-        if total_forecast_vol <= 0 or total_group_workload <= 0:
-            for idx in group.index:
-                erlang_results_dict[idx] = {'Domestic_Erlang_FTE': 0.0, 'Telus_Erlang_FTE': 0.0, 'Total_Erlang_FTE': 0.0}
-            continue
-            
-        origin_profile = profile_df[profile_df['origin'] == origin]
-        
-        weekly_forecast_vol = total_forecast_vol / WEEKS_IN_MONTH
-        weekly_agent_hours = 0
-        
-        # Run Erlang on the massive pooled volume
-        for _, p_row in origin_profile.iterrows():
-            sim_interval_vol = weekly_forecast_vol * p_row['Interval_Weight']
-            if sim_interval_vol < 0.01: continue
-            
-            req_agents = required_agents(
-                volume=sim_interval_vol,
-                aht=p_row['Avg_AHT'],
-                target_sl=p_row['Target_SLA'],
-                target_time=p_row['SL_Threshold_Seconds']
-            )
-            weekly_agent_hours += (req_agents * 0.5)
-            
-        # Total base FTE required to handle the pooled volume
-        monthly_agent_hours = weekly_agent_hours * WEEKS_IN_MONTH
-        total_pooled_base_fte = monthly_agent_hours / monthly_work_hours
-        
-        # Apportion that efficient base FTE back to the individual clients
-        for idx, row in group.iterrows():
-            # What percentage of the work did this specific client contribute?
-            client_share = row['row_workload'] / total_group_workload
-            
-            # Their share of the Erlang Base Seats
-            client_base_fte = total_pooled_base_fte * client_share
-            
-            # Apply their specific row-level shrinkage rules
-            dom_erlang = calc_final_fte(
-                client_base_fte, row['Domestic_Pct'], 
-                row['domestic_occupancy'], row['domestic_shrinkage'], row['domestic_attrition']
-            )
-            
-            tel_erlang = calc_final_fte(
-                client_base_fte, row['Telus_Pct'], 
-                row['telus_occupancy'], row['telus_shrinkage'], row['telus_attrition']
-            )
-            
-            erlang_results_dict[idx] = {
-                'Domestic_Erlang_FTE': round(dom_erlang, 2),
-                'Telus_Erlang_FTE': round(tel_erlang, 2),
-                'Total_Erlang_FTE': round(dom_erlang + tel_erlang, 2)
-            }
+    # ── 4. Run Erlang engine ──────────────────────────────────────────────
+    logger.info("Running Erlang C engine across all BU/origin pools...")
+    df_final = run_erlang_pool(df_fte, profile_df, logger)
 
-    # =====================================================================
-    # STEP 3: EXPORT
-    # =====================================================================
-    # Reconstruct the list in the exact order of the original dataframe
-    erlang_results = [erlang_results_dict.get(i, {'Domestic_Erlang_FTE': 0, 'Telus_Erlang_FTE': 0, 'Total_Erlang_FTE': 0}) for i in df_fte.index]
-    
-    df_erlang = pd.DataFrame(erlang_results)
-    df_final = pd.concat([df_fte.reset_index(drop=True), df_erlang], axis=1)
-    
-    desktop_path = os.path.join(os.environ['USERPROFILE'], 'Desktop', 'Answerlink_Erlang_FTE_Calculator.csv')
+    logger.info(f"  Output rows: {len(df_final):,} | columns: {len(df_final.columns)}")
+
+    # ── 5. Export ─────────────────────────────────────────────────────────
+    desktop_path = os.path.join(
+        os.environ['USERPROFILE'], 'Desktop', 'Erlang_FTE_Calculator_All_BUs.csv'
+    )
     df_final.to_csv(desktop_path, index=False)
-    
-    logger.info(f"Success! Exported combined FTE requirements to: {desktop_path}")
+    logger.info(f"Export complete → {desktop_path}")
+    logger.info("=" * 70)
+
 
 if __name__ == "__main__":
     main()
-
-
-----
-The Big Picture: What Are We Trying to Accomplish?
-The Problem: The Flaw in "Linear" Staffing
-Currently, your capacity workbook calculates Required FTE using the Linear Workload Method. The formula looks like this:
-(Forecasted Volume × AHT) / (Business Days × Business Hours) / Occupancy / (1 - Shrinkage).
-
-The problem with this method is that it assumes calls arrive perfectly evenly throughout the month. It assumes that if you get 10,000 calls a month, you get the exact same number of calls on a Monday at 9:00 AM as you do on a Friday at 4:30 PM.
-Because call centers have massive peaks (morning rushes) and valleys (slow afternoons), staffing to an "average" guarantees that you will be massively understaffed during the peaks (failing your SLA) and overstaffed during the valleys.
-
-The Solution: Erlang C + Arrival Profiling + Queue Pooling
-We are building an automated pipeline that replaces flat averages with Erlang C, the industry-standard mathematical algorithm for call centers.
-Because Erlang C requires interval data (e.g., half-hour increments) but your financial forecasts are monthly, our solution must:
-
-Learn how your calls actually arrive by looking at historical 30-minute intervals.
-
-Simulate how a future month's volume will distribute across a standard week based on those historical patterns.
-
-Calculate the exact number of "butts in seats" needed for every 30-minute window to hit an 80% SLA.
-
-Apportion those required seats back to specific clients based on their share of the workload.
-
-Convert those seats into payroll FTEs using your exact shrinkage and occupancy metrics.
-
-The Architecture: How the Data Flows
-The entire process is orchestrated by your Python script (run_erlang_capacity.py) using your custom scripthelper.py framework to interact with BigQuery.
-
-Input 1: The 30-Minute Interval Data (cx_interval_30mins_vols.sql)
-This query reaches into your Cisco tables and aggregates historical Answerlink data into precise 30-minute buckets.
-
-What it provides: Offered Volume, AHT, SLA Thresholds (e.g., 30s), and Contractual SLA Targets (e.g., 80%).
-
-Purpose: This provides the "DNA" of your call arrival patterns.
-
-Input 2: The Monthly Forecast Data (cx_fte_calculator.sql)
-This is your existing master query that groups data by Month, Client, and Origin.
-
-What it provides: Actual Volume, Forecasted Volume, Business Days/Hours, Vendor Splits (Domestic_Pct, Telus_Pct), Occupancy, and Shrinkage metrics.
-
-Purpose: This tells us how much volume we are expecting and the specific HR rules (shrinkage) required to turn a "Scheduled Agent" into a "Hired FTE".
-
-The Execution: Step-by-Step Logic in Python
-When you run the Python script, it executes the following mathematical journey in memory:
-
-Step 1: Building the "Pooled" Arrival Profile
-In a modern call center, agents are cross-trained. You don't have one agent sitting around waiting specifically for a "Matrix 1" call while another waits for a "Trestle" call. They share the load.
-
-The script takes all historical interval data and groups it purely by Origin (e.g., Phone vs. Chat), Day of Week, and Time of Day.
-
-It calculates the Interval Weight. For example, it discovers that exactly 1.8% of all phone calls for the entire Answerlink pool always arrive on Mondays between 9:00 AM and 9:30 AM.
-
-Step 2: Simulating the Weekly Workload
-The script loops through every single row in your FTE Calculator (e.g., Matrix 1, May 2026).
-
-It groups all clients together by Month and Origin to get a Total Pooled Monthly Forecast.
-
-It divides the monthly forecast by 4.333 to convert it into a standard Weekly Forecast.
-
-It multiplies that Weekly Forecast by the Interval Weights established in Step 1.
-
-Result: The script now has a simulated 336-row week showing exactly how many calls to expect in every single half-hour slot.
-
-Step 3: The Erlang C Engine
-For every single one of those 336 simulated half-hour slots, the script runs the Erlang C algorithm.
-
-Math: It looks at the simulated volume, the weighted AHT of that time slot, the 30-second target, and the 80% SLA goal.
-
-It uses a while loop to add agents one by one until the mathematical probability of a call waiting longer than 30 seconds drops below 20%.
-
-Result: The script calculates that to handle Monday at 9:00 AM, you need exactly 42 agents logged in and ready. For Monday at 4:30 PM, you only need 18 agents.
-
-Step 4: Converting Intervals to Base FTE
-The script adds up all the required agents for all 336 half-hour slots in the week. Since each slot is 0.5 hours, this gives us the Total Weekly Agent Hours needed "in the chair."
-
-It multiplies this by 4.333 to get the Total Monthly Agent Hours.
-
-It divides this by the total working hours in the month (Business Days × Business Hours) to calculate the Total Pooled Base FTE (the perfect, 100% efficient number of scheduled headcount needed if humans didn't take breaks).
-
-Step 5: Apportionment (Slicing the pie back up)
-Now that the script knows how many highly efficient "Pooled" agents are required for the whole department, it needs to assign the bill back to the individual clients.
-
-It calculates the Workload Share of each client. (e.g., Matrix 1 represents 60% of the total forecasted volume × AHT for the month).
-
-It assigns 60% of the Total Pooled Base FTE to Matrix 1.
-
-Step 6: The "Real World" Layer (Shrinkage & Occupancy)
-Finally, the script takes that apportioned Base FTE for Matrix 1 and applies your specific vendor rules row-by-row.
-
-It splits the Base FTE using Domestic_Pct and Telus_Pct.
-
-It divides the result by the respective Occupancy (e.g., 80% utilization limit).
-
-It divides the result by (1 - Shrinkage) to account for PTO, absenteeism, and coaching.
-
-It multiplies by (1 + Attrition).
-
-The Output
-After completing millions of micro-calculations in seconds, the script takes your original df_fte DataFrame and appends six brand new columns to the far right:
-
-Domestic_Actual_Erlang_FTE
-
-Telus_Actual_Erlang_FTE
-
-Total_Actual_Erlang_FTE
-
-Domestic_Forecast_Erlang_FTE
-
-Telus_Forecast_Erlang_FTE
-
-Total_Forecast_Erlang_FTE
-
-It exports this combined table as a CSV directly to your Desktop.
-
-The ultimate accomplishment: You can now paste this data into your Excel workbook. Management can look at a row and see: "Our linear math said we needed 15 FTEs. But to actually survive the Monday morning peaks and hit our 80% SLA, Erlang math proves we need 18 FTEs.
