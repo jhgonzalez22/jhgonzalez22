@@ -25,6 +25,32 @@ DEFAULT_AHT          = 300      # seconds
 INTERVAL_SQL_PATH = r"C:\WFM_Scripting\Automation\GBQ - cx_interval_30mins_vols.sql"
 FTE_SQL_PATH      = r"C:\WFM_Scripting\Automation\GBQ - cx_fte_calculator.sql"
 
+# BU filter applied to the interval query result.
+# The interval SQL may return data for multiple BUs; we restrict profile
+# building to only the BUs that have defined hours of operation below.
+INTERVAL_BU_FILTER = {'Answerlink'}
+
+# Hours of operation per BU.
+# Keys must match the 'bu' column exactly.
+# Each entry is a list of schedule rules covering day-of-week groups.
+#   dow   : tuple of pandas dayofweek integers (0=Mon ... 6=Sun)
+#   open  : datetime.time — first slot that is in-hours
+#   close : datetime.time — first slot that is out-of-hours (exclusive upper bound)
+#           Use None to mean "open until end of day" (handles midnight close
+#           without an off-by-one on the 23:30 slot).
+#
+# Answerlink schedule:
+#   Mon-Fri  07:00 - 00:00 (midnight)
+#   Sat-Sun  07:30 - 22:00
+from datetime import time as dtime
+
+HOURS_OF_OPERATION: dict = {
+    'Answerlink': [
+        {'dow': (0, 1, 2, 3, 4), 'open': dtime(7, 0),  'close': None       },  # Mon-Fri 07:00-midnight
+        {'dow': (5, 6),          'open': dtime(7, 30), 'close': dtime(22, 0)},  # Sat-Sun 07:30-22:00
+    ],
+}
+
 
 # =============================================================================
 # MATH HELPERS
@@ -108,6 +134,38 @@ def linear_base_fte(
 
 
 # =============================================================================
+# HOURS OF OPERATION FILTER
+# =============================================================================
+
+def is_in_hours(bu: str, dow: int, slot_time) -> bool:
+    """
+    Returns True if a given slot (day-of-week + time) falls within the
+    configured hours of operation for the BU.
+
+    If a BU has no entry in HOURS_OF_OPERATION all slots are treated as
+    in-hours so the pipeline degrades gracefully for unconfigured BUs.
+
+    Args:
+        bu        : BU name matching HOURS_OF_OPERATION keys
+        dow       : pandas dayofweek integer (0=Mon ... 6=Sun)
+        slot_time : datetime.time representing the interval_start time
+    """
+    rules = HOURS_OF_OPERATION.get(bu)
+    if rules is None:
+        return True                         # no config → allow all slots
+
+    for rule in rules:
+        if dow in rule['dow']:
+            if slot_time < rule['open']:
+                return False                # before opening
+            if rule['close'] is not None and slot_time >= rule['close']:
+                return False                # at or after close
+            return True
+
+    return False                            # dow not covered by any rule
+
+
+# =============================================================================
 # INTERVAL PROFILE BUILDER
 # =============================================================================
 
@@ -137,6 +195,26 @@ def build_arrival_profiles(df_intervals: pd.DataFrame) -> pd.DataFrame:
     # Numeric coercion (Avg_AHT / Service_Level come through as object)
     for col in ['Offered_Volume', 'Avg_AHT', 'SL_Threshold_Seconds']:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    # ── Hours-of-operation filter ─────────────────────────────────────────
+    # Exclude any slot that falls outside the BU's configured operating hours.
+    # This ensures off-hours slots (overnight, pre-open) never contribute
+    # agent-hours to the Erlang calculation or distort the weight distribution.
+    before_filter = len(df)
+    df['_in_hours'] = df.apply(
+        lambda r: is_in_hours(r['bu'], r['dow'], r['time']), axis=1
+    )
+    df = df[df['_in_hours']].drop(columns=['_in_hours'])
+    after_filter = len(df)
+
+    # Log how many slots were excluded per BU/origin so the filter is auditable
+    for (bu_val, origin_val), grp in df.groupby(['bu', 'origin']):
+        pass  # counts logged below via before/after totals
+
+    # Note: logging happens in main() where the logger is available.
+    # Store filter stats on the dataframe as attributes for the caller to log.
+    df.attrs['slots_before_filter'] = before_filter
+    df.attrs['slots_after_filter']  = after_filter
 
     # Derived workload column for weighted-AHT calculation
     df['workload'] = df['Offered_Volume'] * df['Avg_AHT']
@@ -458,6 +536,15 @@ def main():
     df_fte       = prep_fte_dataframe(df_fte_raw.copy())
     df_intervals = prep_interval_dataframe(df_intervals_raw.copy())
 
+    # Filter interval data to only BUs configured for Erlang processing.
+    # This prevents unconfigured BUs from polluting the arrival profiles.
+    pre_filter_rows = len(df_intervals)
+    df_intervals = df_intervals[df_intervals['bu'].isin(INTERVAL_BU_FILTER)].copy()
+    logger.info(
+        f"  Interval BU filter ({', '.join(sorted(INTERVAL_BU_FILTER))}): "
+        f"{pre_filter_rows:,} → {len(df_intervals):,} rows"
+    )
+
     # Log coverage summary
     for bu in df_fte['bu'].unique():
         sub = df_fte[df_fte['bu'] == bu]
@@ -478,9 +565,20 @@ def main():
     logger.info("Building pooled arrival profiles...")
     profile_df = build_arrival_profiles(df_intervals)
     logger.info(
+        f"  Hours-of-operation filter: "
+        f"{df_intervals.attrs.get('slots_before_filter', '?'):,} → "
+        f"{df_intervals.attrs.get('slots_after_filter', '?'):,} interval rows"
+    )
+    logger.info(
         f"  Profile rows: {len(profile_df):,} "
         f"across {profile_df[['bu','origin']].drop_duplicates().shape[0]} bu/origin pools"
     )
+    # Log slot counts per pool so it's easy to verify the operating window
+    for (bu_val, origin_val), grp in profile_df.groupby(['bu', 'origin']):
+        logger.info(
+            f"    {bu_val} / {origin_val}: {len(grp)} in-hours slots "
+            f"(of 336 possible)"
+        )
 
     # ── 4. Run Erlang engine ──────────────────────────────────────────────
     logger.info("Running Erlang C engine across all BU/origin pools...")
